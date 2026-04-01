@@ -75,7 +75,9 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
         return None, None, None, n_redundant
 
     if expert_map_path:
-        eplb_enable = True
+        if not (os.path.exists(expert_map_path) and os.access(expert_map_path, os.R_OK)):
+            raise ValueError("Invalid EPLB path")
+
         global_placement, physical_count = expert_file_to_tensor(expert_map_path, layer_id)
         if physical_count is not None:
             n_redundant = physical_count - n_experts
@@ -99,7 +101,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
         global_expert_map.append(expert_map)
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
-    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu() if eplb_enable else None
+    log2phy = generate_log2phy_map(global_expert_map, moe_config.ep_rank).npu()
 
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
 
