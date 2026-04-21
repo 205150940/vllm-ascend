@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from functools import wraps
 from typing import Any, cast
 
@@ -106,6 +107,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        gloo_timeout_seconds: int | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -162,7 +164,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
                     device_group=self.device_group,
                     unique_name=self.unique_name,
                 )
-
+            self.group_type = "normal"
             from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
             if use_message_queue_broadcaster and self.world_size > 1:

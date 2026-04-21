@@ -19,6 +19,7 @@
 
 import math
 import sys
+import threading
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -434,6 +435,7 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        self.pause_event = threading.Event()
 
     @property
     def use_cp(self) -> bool:
