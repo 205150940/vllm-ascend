@@ -19,7 +19,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch_npu
 import torch.distributed as dist
 from vllm.logger import logger
 

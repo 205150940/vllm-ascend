@@ -17,7 +17,6 @@
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove eplb utils.
 import json
 import os.path
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -99,7 +98,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
 
 
 def generate_log2phy_map(global_expert_map: torch.Tensor, ep_rank: int):
-    G,E = global_expert_map.shape
+    G, E = global_expert_map.shape
     device = global_expert_map.device
 
     valid_count = (global_expert_map[0] >= 0).sum()
@@ -116,13 +115,10 @@ def generate_log2phy_map(global_expert_map: torch.Tensor, ep_rank: int):
     unique_experts, counts = torch.unique_consecutive(experts_sorted, return_counts=True)
 
     offsets = ep_rank % counts
-    cumsum_counts = torch.cat([
-        torch.zeros(1,dtype=torch.long, device=device),
-        counts[:-1]
-    ]).cumsum(0)
+    cumsum_counts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts[:-1]]).cumsum(0)
     target_indices = cumsum_counts + offsets
 
-    result = torch.zeros(E,dtype=torch.int32,device=device)
+    result = torch.zeros(E, dtype=torch.int32, device=device)
     result[unique_experts] = phy_ids_sorted[target_indices].to(torch.int32)
 
     return result

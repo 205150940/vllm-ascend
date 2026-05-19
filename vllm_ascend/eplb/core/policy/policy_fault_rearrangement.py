@@ -243,7 +243,10 @@ class FaultRearrangement(EplbPolicy):
         return max_rank_expert, swap_rank_expert, max_weight
 
     def _load_no_backup_experts(
-        self,old_deployment,redundant_expert_pos,no_backup_experts,
+        self,
+        old_deployment,
+        redundant_expert_pos,
+        no_backup_experts,
         expert_from_rank,
     ) -> defaultdict[int, list[tuple[int, int]]]:
         node_cards = defaultdict(list)
@@ -253,12 +256,10 @@ class FaultRearrangement(EplbPolicy):
                 node_cards[node_id].append(card_id)
 
         for cards in node_cards.values():
-            cards.sort(key=lambda c: len(redundant_expert_pos[c]),reverse=True)
+            cards.sort(key=lambda c: len(redundant_expert_pos[c]), reverse=True)
 
         active_nodes = sorted(
-            node_cards.keys(),
-            key=lambda n: sum(len(redundant_expert_pos[c]) for c in node_cards[n]),
-            reverse=True
+            node_cards.keys(), key=lambda n: sum(len(redundant_expert_pos[c]) for c in node_cards[n]), reverse=True
         )
         node_idx = 0
 
@@ -274,7 +275,7 @@ class FaultRearrangement(EplbPolicy):
             pos = redundant_expert_pos[card_id].pop()
             old_deployment[card_id][pos] = int(expert_id)
             expert_from_rank[expert_id] = card_id
-            need_load_h2d[card_id].append((pos,int(expert_id)))
+            need_load_h2d[card_id].append((pos, int(expert_id)))
 
             if not redundant_expert_pos[card_id]:
                 cards.pop(0)
@@ -287,8 +288,6 @@ class FaultRearrangement(EplbPolicy):
             node_idx = (node_idx + 1) % len(active_nodes)
 
         return need_load_h2d
-
-
 
     def recomputing_workload(
         self, rank_assignments: np.ndarray, org_workload: np.ndarray
