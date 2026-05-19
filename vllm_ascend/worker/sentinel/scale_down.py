@@ -1,6 +1,7 @@
 import socket
 import struct
 from copy import copy
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -407,7 +408,7 @@ class ScaleDownHelper:
         method = getattr(spec_config, "method", None)
         return method == "mtp" or (isinstance(method, str) and method.endswith("_mtp"))
 
-    def load_expert_weights_to_cpu(self, experts_to_load) -> dict[str, torch.Tensor]:
+    def load_expert_weights_to_cpu(self, experts_to_load, weight_name_to_tensor) -> dict[str, torch.Tensor]:
         """Load specified expert weights from disk into CPU memory"""
 
         weight_suffixes = BASE_WEIGHT_SUFFIXES.union(QUANT_WEIGHT_SUFFIXES) if self.quant else BASE_WEIGHT_SUFFIXES
@@ -450,29 +451,12 @@ class ScaleDownHelper:
                         for suffix in weight_suffixes:
                             weights_to_save.add(_generate_expert_weight_name(layer_id, expert_id, suffix))
 
-        model_loader = get_model_loader(self.vllm_config.load_config)
-        all_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, self.model_runner.get_model())
-
-        saved_weights = {}
-        for weight_name, weight_tensor in all_weight_iter:
-            if weight_name in weights_to_save:
-                if weight_tensor.ndim >= 2:
-                    weight_tensor = weight_tensor.transpose(0, 1).contiguous()
-                if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
-                    weight_tensor = torch.squeeze(weight_tensor)
-                saved_weights[weight_name] = weight_tensor
-
-        # Load from draft model
-        drafter = getattr(self.model_runner, "drafter", None)
-        if drafter is not None and hasattr(drafter, "model") and num_mtp_layers > 0:
-            draft_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, drafter.model)
-            for weight_name, weight_tensor in draft_weight_iter:
-                if weight_name in weights_to_save and weight_name not in saved_weights:
-                    if weight_tensor.ndim >= 2:
-                        weight_tensor = weight_tensor.transpose(0, 1).contiguous()
-                    if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
-                        weight_tensor = torch.squeeze(weight_tensor)
-                    saved_weights[weight_name] = weight_tensor
+        saved_expert_weights = {}
+        for weight_name in weights_to_save:
+            weight_tensor = weight_name_to_tensor[weight_name].transpose(0, 1).contiguous()
+            if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
+                weight_tensor = torch.squeeze(weight_tensor)
+            saved_expert_weights[weight_name] = weight_tensor
 
         return saved_weights
 
