@@ -42,10 +42,10 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import stateless_init_torch_distributed_process_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -294,11 +294,7 @@ class NPUWorker(WorkerBase):
 
         # reload fault expert weights
         self.experts_saved_weights = save_expert_weights_to_ram(
-            cur_rank_need_load_h2d,
-            self.vllm_config,
-            self.model_runner,
-            self.quant,
-            self.expert_weights
+            cur_rank_need_load_h2d, self.vllm_config, self.model_runner, self.quant, self.expert_weights
         )
 
         expand_expert_weights(self.model_runner, num_add_experts_per_rank, self.quant)
@@ -666,7 +662,6 @@ class NPUWorker(WorkerBase):
             all_weight_iter = model_loader.get_all_weights(self.vllm_config.model_config, self.model_runner.model)
             for weight_name, weight_tensor in all_weight_iter:
                 self.saved_expert_weights[weight_name] = weight_tensor
-
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
