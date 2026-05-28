@@ -228,7 +228,8 @@ class NPUModelRunner(GPUModelRunner):
         # the following PR is merged:
         # https://github.com/vllm-project/vllm/pull/28988
         max_pcp_pad_tokens = (
-                vllm_config.parallel_config.prefill_context_parallel_size * 2 * vllm_config.scheduler_config.max_num_seqs
+                vllm_config.parallel_config.prefill_context_parallel_size *
+                2 * vllm_config.scheduler_config.max_num_seqs
         )
         vllm_config.scheduler_config.max_num_batched_tokens += max_pcp_pad_tokens
         with _torch_cuda_wrapper():
