@@ -134,7 +134,6 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-from vllm_ascend.worker.descale import patch_get_all_weights
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -2754,8 +2753,6 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
 
-        _saved_expert_weights_dict = getattr(self, "_saved_expert_weights_dict", None)
-
         if self.ascend_config.mix_placement:
             # TODO: Enabling the mix placement in deepseek_v2.py
             # remove this part after the mix placement merged into vllm
@@ -2768,12 +2765,7 @@ class NPUModelRunner(GPUModelRunner):
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 self.vllm_config.parallel_config.enable_eplb = True
-
-            if _saved_expert_weights_dict is not None and self.vllm_config.parallel_config.enable_fault_tolerance:
-                with patch_get_all_weights(_saved_expert_weights_dict):
-                    self.model: nn.Module = get_model(vllm_config=self.vllm_config)
-            else:
-                self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
             if self.dynamic_eplb:
                 model_register(self.model)
             if self.drafter:

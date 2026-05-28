@@ -286,15 +286,8 @@ class NPUWorker(WorkerBase):
     def create_worker_sentinel(self, worker_cmd_addr: str):
         assert self.vllm_config.parallel_config.enable_fault_tolerance is True, "enable_fault_tolerance is False"
 
-        def clear_input_batch_callback():
-            input_batch = self.model_runner.input_batch
-            cached_req_ids = input_batch.req_id_to_index.keys()
-            for req_id in list(cached_req_ids):
-                input_batch.remove_request(req_id)
-
         self.worker_sentinel = NPUWorkerSentinel(
             self.parallel_config,
-            clear_input_batch_callback,
             self.device,
             worker_cmd_addr,
             self,
@@ -490,7 +483,9 @@ class NPUWorker(WorkerBase):
             self.model_runner._saved_expert_weights_dict = self.weight_name_to_tensor
 
         with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
+            with patch_get_all_weights(self.weight_name_to_tensor,
+                                       self.vllm_config.parallel_config.enable_fault_tolerance):
+                self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
