@@ -1,7 +1,7 @@
 import socket
 import struct
-from copy import copy
 from contextlib import contextmanager
+from copy import copy
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -675,18 +675,19 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
+
 @contextmanager
 def patch_get_all_weights(
-        saved_expert_weights_dict: dict[str, torch.Tensor] | None = None,
-        enable_fault_tolerance: bool = False,
-        drafter_model: torch.nn.Module | None = None,
+    saved_expert_weights_dict: dict[str, torch.Tensor] | None = None,
+    enable_fault_tolerance: bool = False,
+    drafter_model: torch.nn.Module | None = None,
 ):
     if saved_expert_weights_dict is None or not enable_fault_tolerance:
         yield
         return
 
-    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
     from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
     loader = get_model_loader(LoadConfig())
     if not isinstance(loader, DefaultModelLoader):
@@ -694,7 +695,7 @@ def patch_get_all_weights(
             "Fault tolerance weight saving only supports DefaultModelLoader, "
             "Current loader type: %s. "
             "Scale-down weight reload will not available. ",
-            type(loader).__name__
+            type(loader).__name__,
         )
         yield
         return
@@ -715,6 +716,7 @@ def patch_get_all_weights(
         yield
     finally:
         DefaultModelLoader.get_all_weights = original_get_all_weights
+
 
 def reconfigure_moe(
     model_runner: NPUModelRunner,

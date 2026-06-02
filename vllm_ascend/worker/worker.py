@@ -44,7 +44,6 @@ from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.model_executor.model_loader import get_model_loader
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -485,9 +484,9 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             drafter = getattr(self.model_runner, "drafter_model", None)
             drafter_model = getattr(drafter, "model", None)
-            with patch_get_all_weights(self.weight_name_to_tensor,
-                                       self.vllm_config.parallel_config.enable_fault_tolerance,
-                                       drafter_model):
+            with patch_get_all_weights(
+                self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
+            ):
                 self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> float:

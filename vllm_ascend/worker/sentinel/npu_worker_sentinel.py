@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from collections.abc import Callable
 
 import msgspec
 import torch
@@ -105,7 +104,7 @@ class NPUWorkerSentinel(BaseSentinel):
             self.dp_rank,
             self.dp_size,
             backend="gloo",
-            gloo_timeout_seconds = self.worker.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout
+            gloo_timeout_seconds=self.worker.vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
         )
 
         return FaultToleranceResult(ft_request.request_id, True)
@@ -176,7 +175,7 @@ class NPUWorkerSentinel(BaseSentinel):
             raise RuntimeError("only support mask mc2")
 
         # Phase 2: Expert weight reloading
-        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load,self.worker.weight_name_to_tensor)
+        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load, self.worker.weight_name_to_tensor)
         scale_down_helper.reload_expert_weights(experts_to_load, saved_weights)
 
         # Phase 3：EPLB adaptor update
@@ -232,4 +231,3 @@ class NPUWorkerSentinel(BaseSentinel):
         input_batch.req_prompt_embeds.clear()
         self.worker.model_runner.async_output_copy_stream = torch.cuda.Stream()
         self.worker.model_runner.prepare_inputs_event = torch.Event()
-
