@@ -176,7 +176,7 @@ class NPUWorkerSentinel(BaseSentinel):
             raise RuntimeError("only support mask mc2")
 
         # Phase 2: Expert weight reloading
-        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load)
+        saved_weights = scale_down_helper.load_expert_weights_to_cpu(experts_to_load,self.worker.weight_name_to_tensor)
         scale_down_helper.reload_expert_weights(experts_to_load, saved_weights)
 
         # Phase 3：EPLB adaptor update

@@ -70,7 +70,7 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import NPUWorkerSentinel
-from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map
+from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -483,8 +483,11 @@ class NPUWorker(WorkerBase):
             self.model_runner._saved_expert_weights_dict = self.weight_name_to_tensor
 
         with context, set_current_vllm_config(self.vllm_config):
+            drafter = getattr(self.model_runner, "drafter_model", None)
+            drafter_model = getattr(drafter, "model", None)
             with patch_get_all_weights(self.weight_name_to_tensor,
-                                       self.vllm_config.parallel_config.enable_fault_tolerance):
+                                       self.vllm_config.parallel_config.enable_fault_tolerance,
+                                       drafter_model):
                 self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> float:

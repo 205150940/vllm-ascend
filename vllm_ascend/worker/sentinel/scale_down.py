@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tp_group,
     stateless_init_torch_distributed_process_group,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 from vllm.model_executor.model_loader import get_model_loader
@@ -453,12 +454,14 @@ class ScaleDownHelper:
 
         saved_expert_weights = {}
         for weight_name in weights_to_save:
-            weight_tensor = weight_name_to_tensor[weight_name].transpose(0, 1).contiguous()
+            weight_tensor = weight_name_to_tensor[weight_name]
+            if weight_tensor.ndim >= 2:
+                weight_tensor = weight_tensor.transpose(0, 1).contiguous()
             if any(weight_name.endswith(suffix) for suffix in QUANT_WEIGHT_SUFFIXES):
                 weight_tensor = torch.squeeze(weight_tensor)
             saved_expert_weights[weight_name] = weight_tensor
 
-        return saved_weights
+        return saved_expert_weights
 
     def reload_expert_weights(self, experts_to_load, saved_weights: dict[str, torch.Tensor]) -> None:
         """Load saved expert weights from CPU into the FusedMoE modules."""
@@ -672,6 +675,46 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
     timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
     _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
+@contextmanager
+def patch_get_all_weights(
+        saved_expert_weights_dict: dict[str, torch.Tensor] | None = None,
+        enable_fault_tolerance: bool = False,
+        drafter_model: torch.nn.Module | None = None,
+):
+    if saved_expert_weights_dict is None or not enable_fault_tolerance:
+        yield
+        return
+
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    from vllm.config import LoadConfig
+
+    loader = get_model_loader(LoadConfig())
+    if not isinstance(loader, DefaultModelLoader):
+        logger.warning(
+            "Fault tolerance weight saving only supports DefaultModelLoader, "
+            "Current loader type: %s. "
+            "Scale-down weight reload will not available. ",
+            type(loader).__name__
+        )
+        yield
+        return
+    original_get_all_weights = DefaultModelLoader.get_all_weights
+
+    def saving_get_all_weights(self_loader, model_config, model):
+        for name, tensor in original_get_all_weights(self_loader, model_config, model):
+            saved_expert_weights_dict[name] = tensor
+            yield name, tensor
+
+        if drafter_model is not None:
+            for name, tensor in original_get_all_weights(self_loader, model_config, drafter_model):
+                saved_expert_weights_dict[name] = tensor
+                yield name, tensor
+
+    DefaultModelLoader.get_all_weights = saving_get_all_weights
+    try:
+        yield
+    finally:
+        DefaultModelLoader.get_all_weights = original_get_all_weights
 
 def reconfigure_moe(
     model_runner: NPUModelRunner,
