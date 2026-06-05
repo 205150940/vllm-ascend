@@ -659,7 +659,7 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
             vllm_config.parallel_config.data_parallel_size,
             listen_socket=listen_sockets[0] if listen_sockets else None,
             backend="gloo",
-            gloo_timeout_seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout,
+            gloo_timeout_seconds=vllm_config.parallel_config.gloo_timeout_seconds,
         )
         get_dynamic_eplb_group().group_type = group_type
 
@@ -670,10 +670,9 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig, coord_store, group_type="nor
         vllm_config.parallel_config.data_parallel_size,
         backend="gloo",
         listen_socket=listen_sockets[1] if listen_sockets else None,
+        gloo_timeout_seconds=vllm_config.parallel_config.gloo_timeout_seconds,
     )
     get_dp_group().group_type = group_type
-    timeout = timedelta(seconds=vllm_config.parallel_config.fault_tolerance_config.gloo_comm_timeout)
-    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
 
     for sock in listen_sockets:
         with contextlib.suppress(OSError):
