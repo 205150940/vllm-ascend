@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -111,9 +112,13 @@ class FaultRearrangement(EplbPolicy):
         if self.n_remain_cards == 0:
             raise ValueError("All cards are faulty, no available cards.")
 
-        self.org_expert_per_card = self.n_experts // self.n_remain_cards + 1
+        self.org_expert_per_card = math.ceil(self.n_experts / self.n_remain_cards)
         if self.n_experts_per_card < self.org_expert_per_card:
             self.n_add_expert_per_card = self.org_expert_per_card - self.n_experts_per_card
+            raise NotImplementedError(
+                "The number of expert slots is insufficient for the requested scale-down"
+                " operation. Expansion is not currently supported."
+            )
 
         redistributed_experts = []
         old_deployment_after_h2d = []
