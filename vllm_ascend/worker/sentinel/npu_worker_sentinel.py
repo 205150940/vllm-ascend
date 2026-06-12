@@ -239,5 +239,6 @@ class NPUWorkerSentinel(BaseSentinel):
         input_batch.req_prompt_embeds.clear()
         self.worker.model_runner.async_output_copy_stream = torch.cuda.Stream()
         self.worker.model_runner.prepare_inputs_event = torch.Event()
+
         torch.npu.synchronize()
         logger.info("Device and worker states are cleaned.")
