@@ -445,7 +445,7 @@ class NPUModelRunner(GPUModelRunner):
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = torch.zeros(
                 max_buffer_num_tokens, dtype=torch.int64, device=self.device)
-            
+
         # Create a CPU numpy buffer for positions computation when
         # self.positions is a plain tensor (non-CpuGpuBuffer case).
         self._positions_cpu_buf = torch.zeros(
@@ -507,7 +507,7 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
             self.shared_dict = self.manager.dict(
-                {"expert_map": None, "moe_load": None, "expert_maps": None, "scale_down": False})
+                {"expert_map": None, "moe_load": None, "expert_maps": None, "scale_down": False, "update_layer_id": -1})
             self.eplb_process = EplbProcess(
                 shared_dict=self.shared_dict,
                 policy_type=self.policy_type,
@@ -681,7 +681,7 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        # On certain devices, CPU-side all_reduce may return dirty data. 
+        # On certain devices, CPU-side all_reduce may return dirty data.
         # When dp_allreduce_on_npu is True, route DP metadata
         # synchronization through the NPU device group to avoid data corruption.
         device_str, group = (
@@ -1065,7 +1065,7 @@ class NPUModelRunner(GPUModelRunner):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
-        
+
         self.discard_request_mask.np[:num_reqs] = discard_requests_mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
@@ -1672,7 +1672,7 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream): 
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
@@ -1969,7 +1969,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -1998,9 +1998,9 @@ class NPUModelRunner(GPUModelRunner):
         if ((
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase 
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios. 
-            # It does not affect other use cases. This is a temporary workaround and 
+            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
+            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
+            # It does not affect other use cases. This is a temporary workaround and
             # will be removed once upstream vLLM provides native support for PCP + MM.
             self.pcp_size > 1 and self.supports_mm_inputs and get_pp_group().is_first_rank
             and not self.model_config.is_encoder_decoder
@@ -3449,10 +3449,10 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        
+
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
-        
+
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
@@ -4131,7 +4131,7 @@ class NPUModelRunner(GPUModelRunner):
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(kv_cache_spec)
                         sparse_kv_cache_ratio = kv_cache_spec.sparse_kv_cache_ratio
-                        
+
                         # A5 sparse C8: (ckv_ratio, qli_ratio, qli_scale_ratio, None)
                         # A3 sparse C8: (k_ratio, v_ratio, qli_ratio, qli_scale_ratio)
                         if current_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
@@ -4531,11 +4531,11 @@ class NPUModelRunner(GPUModelRunner):
                         k_cache_dtype, v_cache_dtype = self.vllm_config.quant_config.get_kv_quant_dtype(
                             layer_name, current_kv_cache_spec.dtype, self.model_config
                         )
-                    
+
                     # A5 sparse C8: ckv uses float8_e4m3fn
                     if self.use_sparse and current_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
                         k_cache_dtype = self.c8_k_cache_dtype
-                    
+
                     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
                     if self.use_sparse and current_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
                         v_cache = None
@@ -4987,7 +4987,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # NOTE: This is a serious problem that we maintain two extra copies of the KV cache as the instance
         # variable of the attention layers, when they are local variables in the upstream vLLM code.
-        # We have to manually clear them here to release memory after profiling. 
+        # We have to manually clear them here to release memory after profiling.
         for layer in self.compilation_config.static_forward_context.values():
             if hasattr(layer, "impl"):
                 if hasattr(layer.impl, "key_cache"):

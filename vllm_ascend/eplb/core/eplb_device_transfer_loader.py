@@ -39,7 +39,7 @@ class D2DExpertWeightLoader:
         self.state = ExpertWeightUpdateState.WAITING
         self.recv_expert_list = []
         self.num_layers = 0
-        self.comm_group = None
+
         if get_ascend_config().eplb_config.dynamic_eplb:
             self.comm_group = get_dynamic_eplb_group()
 
@@ -55,6 +55,7 @@ class D2DExpertWeightLoader:
             return
 
         self.updated_expert_map = updated_expert_map
+        rank_id = self.eplb_adaptor.rank_id
 
         self.layer_id = layer_id
         self.comm_op_list = []
@@ -77,7 +78,7 @@ class D2DExpertWeightLoader:
                         dist.irecv, buffer_tensor, self.comm_group.ranks[recv_rank], group=self.comm_group.device_group
                     )
                 )
-            local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
+            local_expert_to_replace = self.updated_expert_map[rank_id][global_expert_id_to_recv].item()
             self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
 
         self.state = ExpertWeightUpdateState.READY
