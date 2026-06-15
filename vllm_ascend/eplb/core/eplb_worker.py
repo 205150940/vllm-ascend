@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import PolicyFactory
 
@@ -47,6 +48,8 @@ class EplbWorker:
         n_ranks_per_node = torch.npu.device_count()
         self.rank_id_to_initial_global = list(range(n_total_ranks))
         self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
+        self.enable_dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+        self.old_load_info = None
 
     def do_update(self):
         # put data in to queue
@@ -64,6 +67,8 @@ class EplbWorker:
                 self.num_local_experts = self.old_expert_maps.max() + 1
             else:
                 raise ValueError("Failed to get expert_maps from shared_dict.")
+        if self.shared_dict["scale_down"] and self.enable_dynamic_eplb:
+            self.old_expert_maps = self.get_init_expert_maps()
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
@@ -76,9 +81,10 @@ class EplbWorker:
         if self.shared_dict["scale_down"]:
             exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
             enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
+            update_layer_id = self.shared_dict["update_layer_id"]
             self.update_rank_id(exclude_dp_ranks)
             new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
-                load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure
+                old_placement, exclude_dp_ranks, enable_d2d_after_failure, update_layer_id
             )
             if not torch.is_tensor(old_deployment):
                 old_placement = torch.tensor(old_deployment)
@@ -88,29 +94,17 @@ class EplbWorker:
         else:
             num_add_experts_per_rank = 0
             _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-
-            # self.latest_expert_hotness = {
-            #     "current_mean": current_mean,
-            #     "current_max": current_max,
-            #     "update_mean": update_mean,
-            #     "update_max": update_max,
-            #     "current_imbalance_list": current_imbalance_list,
-            #     "update_imbalance_list": update_imbalance_list,
-            # }
-            # # ms-service-metric end.
-            # logger.info(
-            #     "[eplb/worker] Expert hotness imbalance, current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
-            #     current_mean,
-            #     current_max,
-            #     update_mean,
-            #     update_max,
-            # )
+            self.old_load_info = self.get_original_workload(load_info)
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
-        self.update_expert_map(new_expert_maps)
+
+        if self.shared_dict["scale_down"] and self.shared_dict["enable_d2d_after_failure"]:
+            self.update_expert_map(self.old_expert_maps.clone())
+        else:
+            self.update_expert_map(new_expert_maps)
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
         self.old_expert_maps = new_expert_maps
@@ -217,7 +211,7 @@ class EplbWorker:
                 expert_send_info_this_layer[src_rank_id].append((dst_global_rank_id, expert_id))
                 expert_recv_info_this_layer[dst_rank_id].append((src_global_rank_id, expert_id))
 
-        yield (
+            yield (
                 expert_send_info_this_layer,
                 expert_recv_info_this_layer,
                 updated_expert_maps_this_layer,
@@ -301,7 +295,7 @@ class EplbWorker:
             send_all.append(send_info_this_rank)
             recv_all.append(recv_info_this_rank)
 
-            maps.append(new_expert_map[self.rank_id].numpy().tolist())
+            maps.append(new_expert_map.numpy().tolist())
 
             log2phy_map = generate_log2phy_map(
                 new_expert_map,
@@ -314,17 +308,32 @@ class EplbWorker:
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
-    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
+    def trigger_fault_redeployment(self, old_placement, exclude_dp_ranks, enable_d2d_after_failure, update_layer_id):
         policy = PolicyFactory.generate_policy(4)
         policy.failed_cards = exclude_dp_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
         policy.rank_id_to_node_id = self.rank_id_to_node_id
+        policy.update_layer_id = update_layer_id
 
         new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
-            old_placement, load_info
+            old_placement, self.old_load_info
         )
 
         return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
+
+    def get_original_workload(self, load_info) -> np.ndarray:
+        n_layer, n_rank, n_experts_per_card = load_info.shape
+        workload_new = np.zeros((n_layer, self.num_local_experts))
+
+        for layer_idx in range(n_layer):
+            for card_idx in range(n_rank):
+                for index in range(n_experts_per_card):
+                    cur_expert = self.old_expert_maps[layer_idx][card_idx][index]
+                    cur_load = load_info[layer_idx][card_idx][index]
+                    workload_new[layer_idx][cur_expert] += cur_load
+
+        return workload_new
+
 
     def update_rank_id(self, exclude_dp_ranks: list[int]):
         unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
@@ -437,6 +446,8 @@ class EplbProcess:
                 while True:
                     if not block_update_q.empty():
                         continue
+                    if self.shared_dict["scale_down"]:
+                        break
                     block_update_q.put(packed_update_info)
                     break
 
@@ -446,6 +457,14 @@ class EplbProcess:
                     e,
                     exc_info=True,
                 )
+                break
+
+    def clear_block_update_q(self):
+        while not self.block_update_q.empty():
+            try:
+                self.block_update_q.get_nowait()
+            except Exception as e:
+                logger.error("[EPLB subprocess exiting due to error: %s]", e)
                 break
 
     def _launch_process(self):
