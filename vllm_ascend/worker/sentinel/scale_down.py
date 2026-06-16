@@ -566,6 +566,7 @@ class ScaleDownHelper:
         model_runner.eplb_loader.updated_expert_map = None
         model_runner.eplb_loader.layer_id = -1
         from vllm_ascend.eplb.core.eplb_device_transfer_loader import ExpertWeightUpdateState
+
         model_runner.eplb_loader.state = ExpertWeightUpdateState.WAITING
 
         if num_add_experts_per_rank > 0:
