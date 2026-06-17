@@ -19,14 +19,12 @@
 
 import copy
 import gc
-from datetime import timedelta
 from types import NoneType
 
 import torch
 import torch.nn as nn
 import torch_npu
 import vllm.envs as envs_vllm
-from torch.distributed.distributed_c10d import _set_pg_timeout
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
@@ -35,7 +33,6 @@ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import (
     Handle,
-    get_dp_group,
     get_pp_group,
     get_tp_group,
 )
@@ -642,10 +639,6 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-        if self.vllm_config.parallel_config.enable_fault_tolerance:
-            timeout = timedelta(seconds=self.vllm_config.parallel_config.gloo_timeout_seconds)
-            dp_cpu_group = get_dp_group()
-            _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
     def _create_profiler(self, trace_name: str):
         """Create torch_npu profiler with trace naming for unique files per worker (RFC #6954)."""
