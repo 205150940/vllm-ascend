@@ -6,6 +6,10 @@ import msgspec
 import torch
 import torch_npu
 import zmq
+from datetime import timedelta
+
+from torch.distributed.distributed_c10d import _set_pg_timeout
+
 from vllm.config import ParallelConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import _get_unique_name, get_dp_group
@@ -54,7 +58,7 @@ class NPUWorkerSentinel(BaseSentinel):
         self.data_parallel_master_port = parallel_config.data_parallel_master_port
         self.dp_size = parallel_config.data_parallel_size
         torch.accelerator.set_device_index(self.device)
-
+        self.set_dp_gloo_timeout(parallel_config)
         self.engine_core_cmd_socket = make_zmq_socket(
             self.ctx,
             worker_cmd_addr,
@@ -64,6 +68,11 @@ class NPUWorkerSentinel(BaseSentinel):
         )
 
         threading.Thread(target=self.run, daemon=True, name="WorkerSentinelThread").start()
+
+    def set_dp_gloo_timeout(self,parallel_config: ParallelConfig) -> None:
+        timeout = timedelta(seconds=parallel_config.gloo_timeout_seconds)
+        dp_cpu_group = get_dp_group()
+        _set_pg_timeout(timeout=timeout, group=dp_cpu_group.cpu_group)
 
     def run(self):
         # Wait for fault tolerance instructions from EngineCoreSentinel
