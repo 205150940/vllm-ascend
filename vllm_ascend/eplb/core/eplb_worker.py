@@ -43,6 +43,11 @@ class EplbWorker:
         self.rank_id = get_ep_group().rank_in_group
         self.multi_stage = policy_type == 3
 
+        n_total_ranks = dist.get_world_size()
+        n_ranks_per_node = torch.npu.device_count()
+        self.rank_id_to_initial_global = list(range(n_total_ranks))
+        self.rank_id_to_node_id = [rank_id // n_ranks_per_node for rank_id in range(n_total_ranks)]
+
     def do_update(self):
         # put data in to queue
         # in process self.policy.generate_policy()
@@ -62,42 +67,44 @@ class EplbWorker:
 
         # Get MOE load information
         load_info = self.fetch_and_sum_load_info()
-        if load_info is None:
+        if load_info is None and not self.shared_dict["scale_down"]:
             logger.debug("[eplb/worker] No moe_load data available yet, skipping this cycle")
             return
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+        if self.shared_dict["scale_down"]:
+            exclude_dp_ranks = self.shared_dict["excluded_dp_ranks"]
+            enable_d2d_after_failure = self.shared_dict["enable_d2d_after_failure"]
+            self.update_rank_id(exclude_dp_ranks)
+            new_placement, old_deployment, need_load_h2d, num_add_experts_per_rank = self.trigger_fault_redeployment(
+                load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure
+            )
+            if not torch.is_tensor(old_deployment):
+                old_placement = torch.tensor(old_deployment)
+            self.old_expert_maps = self.local2global(old_placement)
+            self.shared_dict["need_load_h2d"] = need_load_h2d
+            self.shared_dict["num_add_experts_per_rank"] = num_add_experts_per_rank
+        else:
+            num_add_experts_per_rank = 0
+            _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
-        if self.rank_id == 0:
-            if self.multi_stage:
-                hotness = self._calculate_hotness(old_placement, load_info.sum(0))
-            else:
-                hotness = self._calculate_hotness(old_placement, load_info)
-            # ms-service-metric begin: expose EPLB hotness details for metrics collection.
-            current_mean, current_max, current_imbalance_list = self._compute_imbalance(
-                old_placement, hotness, return_list=True
-            )
-            update_mean, update_max, update_imbalance_list = self._compute_imbalance(
-                new_placement, hotness, return_list=True
-            )
-            self.latest_expert_hotness = {
-                "current_mean": current_mean,
-                "current_max": current_max,
-                "update_mean": update_mean,
-                "update_max": update_max,
-                "current_imbalance_list": current_imbalance_list,
-                "update_imbalance_list": update_imbalance_list,
-            }
-            # ms-service-metric end.
-            logger.info(
-                "[eplb/worker] Expert hotness imbalance, current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
-                current_mean,
-                current_max,
-                update_mean,
-                update_max,
-            )
+            # self.latest_expert_hotness = {
+            #     "current_mean": current_mean,
+            #     "current_max": current_max,
+            #     "update_mean": update_mean,
+            #     "update_max": update_max,
+            #     "current_imbalance_list": current_imbalance_list,
+            #     "update_imbalance_list": update_imbalance_list,
+            # }
+            # # ms-service-metric end.
+            # logger.info(
+            #     "[eplb/worker] Expert hotness imbalance, current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
+            #     current_mean,
+            #     current_max,
+            #     update_mean,
+            #     update_max,
+            # )
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -109,7 +116,14 @@ class EplbWorker:
         self.old_expert_maps = new_expert_maps
         logger.debug("[eplb/worker] EPLB Process compute complete")
 
-        packed_update_info = self.pack_update_info(update_info)
+        if self.shared_dict["scale_down"] and not self.shared_dict["enable_d2d_after_failure"]:
+            packed_update_info = []
+        else:
+            packed_update_info = self.pack_update_info(update_info)
+        self.shared_dict["scale_down"] = False
+
+        if num_add_experts_per_rank > 0:
+            self.rank_id_to_initial_global = list(range(len(self.rank_id_to_initial_global)))
 
         return packed_update_info
 
@@ -199,10 +213,12 @@ class EplbWorker:
                 if src_rank_id not in expert_send_info_this_layer:
                     expert_send_info_this_layer[src_rank_id] = []
 
-                expert_send_info_this_layer[src_rank_id].append((dst_rank_id, expert_id))
-                expert_recv_info_this_layer[dst_rank_id].append((src_rank_id, expert_id))
+                dst_global_rank_id = self.rank_id_to_initial_global[dst_rank_id]
+                src_global_rank_id = self.rank_id_to_initial_global[src_rank_id]
+                expert_send_info_this_layer[src_rank_id].append((dst_global_rank_id, expert_id))
+                expert_recv_info_this_layer[dst_rank_id].append((src_global_rank_id, expert_id))
 
-            yield (
+        yield (
                 expert_send_info_this_layer,
                 expert_recv_info_this_layer,
                 updated_expert_maps_this_layer,
@@ -299,6 +315,35 @@ class EplbWorker:
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
+    def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
+        policy = PolicyFactory.generate_policy(4)
+        policy.failed_cards = exclude_dp_ranks
+        policy.enable_d2d_after_failure = enable_d2d_after_failure
+        policy.rank_id_to_node_id = self.rank_id_to_node_id
+
+        new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank = policy.rebalance_experts(
+            old_placement, load_info
+        )
+
+        return new_deployment, old_deployment, need_load_h2d, num_add_experts_per_rank
+
+    def update_rank_id(self, exclude_dp_ranks: list[int]):
+        unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
+        fault_count = 0
+        for fault_id in unique_fault_ids:
+            if fault_id <= self.rank_id:
+                fault_count += 1
+            else:
+                break
+        self.rank_id = self.rank_id - fault_count
+        for i in reversed(unique_fault_ids):
+            self.rank_id_to_initial_global.pop(i)
+            self.rank_id_to_node_id.pop(i)
+
+    def warm_up_shared_dict(self):
+        old_expert_maps = self.get_init_expert_maps()
+        _ = old_expert_maps.max()
+
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):
         imbalance_list = []
@@ -362,6 +407,9 @@ class EplbProcess:
             tp_size=tp_size,
         )
 
+        warm_maps = torch.zeros((1, 1, 1), dtype=torch.int32)
+        self.shared_dict["expert_maps"] = warm_maps
+
     def worker_process(self, planner_q, block_update_q):
         """
         Subprocess entry: bind to specified NPU, loop waiting for planner_q to wake up,
@@ -380,6 +428,7 @@ class EplbProcess:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 
             warm_up()
+        self.worker.warm_up_shared_dict()
         while True:
             try:
                 planner_q.get()
