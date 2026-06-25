@@ -78,6 +78,7 @@ torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 from vllm_ascend.worker.sentinel.npu_worker_sentinel import WorkerSentinel
+from vllm_ascend.worker.sentinel.scale_down import init_elastic_info, init_ep2dp_map, patch_get_all_weights
 torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
     ["torch.npu.current_stream"],
     TorchInGraphFunctionVariable,
@@ -122,6 +123,7 @@ class NPUWorker(WorkerBase):
 
         configure_ascend_file_logging()
         check_ascend_device_type()
+        self.weight_name_to_tensor = {}
 
         super().__init__(
             vllm_config=vllm_config,
@@ -184,6 +186,33 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
+            self.ep2dp_map = init_ep2dp_map(
+                self.vllm_config.parallel_config.data_parallel_size,
+                self.vllm_config.parallel_config.tensor_parallel_size,
+            )
+            self.quant = self.model_config.quantization is not None
+            if hasattr(self.vllm_config.model_config.hf_config, "num_experts"):
+                self.num_logical_expert = self.vllm_config.model_config.hf_config.num_experts
+            elif hasattr(self.vllm_config.model_config.hf_config, "n_routed_experts"):
+                self.num_logical_expert = self.vllm_config.model_config.hf_config.n_routed_experts
+            else:
+                raise ValueError("unknown number of experts")
+
+            self.use_mask_mc2 = False
+            ep_size = (
+                self.vllm_config.parallel_config.data_parallel_size
+                * self.vllm_config.parallel_config.tensor_parallel_size
+            )
+            additional_config = self.vllm_config.additional_config or {}
+            eplb_cfg = additional_config.get("eplb_config", {})
+            num_redundant_experts = int(eplb_cfg.get("num_redundant_experts") or 0)
+            if num_redundant_experts and get_ascend_device_type() in {AscendDeviceType.A3}:
+                self.use_mask_mc2 = True
+
+            self.model_loaded = False
+            init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
+
 
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
@@ -705,8 +734,18 @@ class NPUWorker(WorkerBase):
 
             context = nullcontext()  # type: ignore
 
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
+            self.model_loaded = True
+            # todo Hot backup-related code has not yet been ported here.
+            self.model_runner._saved_expert_weights_dict = self.weight_name_to_tensor
+
         with context, set_current_vllm_config(self.vllm_config):
-            self.model_runner.load_model()
+            drafter = getattr(self.model_runner, "drafter_model", None)
+            drafter_model = getattr(drafter, "model", None)
+            with patch_get_all_weights(
+                    self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
+            ):
+                self.model_runner.load_model()
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
