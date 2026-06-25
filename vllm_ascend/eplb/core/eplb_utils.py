@@ -67,7 +67,7 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
     ep_size = moe_config.ep_size
     global_placement = None
     eplb_enable = eplb_config.dynamic_eplb
-    n_redundant = eplb_config.num_redundant_experts if eplb_enable else 0
+    n_redundant = eplb_config.num_redundant_experts
     num_shared_experts = num_shared_experts if mix_placement else 0
 
     if ep_size == 1:
@@ -75,12 +75,10 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
         return None, None, None, n_redundant
 
     if expert_map_path:
-        eplb_enable = True
+
         global_placement, physical_count = expert_file_to_tensor(expert_map_path, layer_id)
         n_redundant = physical_count - n_experts
-    elif not eplb_enable:
-        _, expert_map, _ = determine_expert_map(ep_size, moe_config.ep_rank, n_experts)
-        return None, expert_map, None, 0
+
 
     if global_placement is None:
         global_placement = generate_global_placement(n_experts, ep_size, n_redundant, num_shared_experts)
@@ -94,43 +92,46 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
         global_expert_map.append(expert_map)
         if rankid == moe_config.ep_rank:
             local_expert_map = expert_map
+    global_expert_map = torch.stack(global_expert_map)
     log2phy = (
         generate_log2phy_map(
             global_expert_map,
             moe_config.ep_rank,
             tp_size=int(tp_size) if tp_size is not None else None,
         ).npu()
-        if eplb_enable
-        else None
     )
 
-    return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
+    return global_expert_map, local_expert_map, log2phy, n_redundant
 
 
-def generate_log2phy_map(global_expert_map, ep_rank, tp_size: int | None = None):
-    log2phy_map = defaultdict(list)
-    valid_count = torch.sum(global_expert_map[0] != -1)
-    for rankid, map_per_rank in enumerate(global_expert_map):
-        for idx, val in enumerate(map_per_rank):
-            val = val.item()
-            if val != -1:
-                log2phy_map[idx].append(val + rankid * valid_count)
+def generate_log2phy_map(global_expert_map: torch.Tensor, ep_rank: int, tp_size: int | None = None):
+    G, E = global_expert_map.shape
+    device = global_expert_map.device
 
-    for key in log2phy_map:
-        num_of_duplications = len(log2phy_map[key])
-        if tp_size is not None and tp_size > 1:
-            tp_rank = ep_rank % tp_size
-            dp_like_rank = ep_rank // tp_size
-            replica_index = (tp_rank + dp_like_rank + key) % num_of_duplications
-        else:
-            replica_index = ep_rank % num_of_duplications
-        log2phy_map[key] = log2phy_map[key][replica_index]
+    valid_count = (global_expert_map[0] >= 0).sum()
 
-    log2phy_map = torch.scatter(
-        torch.zeros(len(log2phy_map), dtype=torch.int32),
-        0,
-        torch.tensor(list(log2phy_map), dtype=torch.int64),
-        torch.tensor(list(log2phy_map.values()), dtype=torch.int32),
-    )
+    valid_mask = global_expert_map >= 0
+    ranks, experts = valid_mask.nonzero(as_tuple=True)
+    slots = global_expert_map[valid_mask]
 
-    return log2phy_map
+    phy_ids = slots + ranks * valid_count
+
+    experts_sorted, sort_ids = experts.sort()
+    phy_ids_sorted = phy_ids[sort_ids]
+
+    unique_experts, counts = torch.unique_consecutive(experts_sorted, return_counts=True)
+
+    if tp_size is not None and tp_size > 1:
+        tp_rank = ep_rank % tp_size
+        dp_like_rank = ep_rank // tp_size
+        offsets = (tp_rank + dp_like_rank + unique_experts) % counts
+    else:
+        offsets = ep_rank % counts
+
+    cumsum_counts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), counts[:-1]]).cumsum(0)
+    target_indices = cumsum_counts + offsets
+
+    result = torch.zeros(E, dtype=torch.int32, device=device)
+    result[unique_experts] = phy_ids_sorted[target_indices].to(torch.int32)
+
+    return result
