@@ -692,6 +692,10 @@ class NPUWorker(WorkerBase):
     def check_health(self) -> None:
         import subprocess
 
+        if self.vllm_config.parallel_config.enable_fault_tolerance:
+            logger.info("Skipping health check: fault tolerance is enabled.")
+            return
+
         logger.info("check_health Start!")
         try:
             result = subprocess.run(
