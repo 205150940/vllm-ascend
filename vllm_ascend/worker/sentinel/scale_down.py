@@ -450,6 +450,8 @@ class ScaleDownHelper:
 
         saved_expert_weights = {}
         for weight_name in weights_to_save:
+            if weight_name not in weight_name_to_tensor:
+                continue
             weight_tensor = weight_name_to_tensor[weight_name]
             if weight_tensor.ndim >= 2:
                 weight_tensor = weight_tensor.transpose(0, 1).contiguous()
@@ -625,9 +627,19 @@ class ScaleDownHelper:
         update_elastic_info(elastic_info, expert_num, raw_ep_size, ep2dp, share_expert_num)
 
     def destroy_comm_group(self) -> None:
-        stateless_destroy_torch_distributed_process_group(get_dp_group().cpu_group)
+        dp_group = get_dp_group()
+        if dp_group is not None and dp_group.cpu_group is not None:
+            stateless_destroy_torch_distributed_process_group(get_dp_group().cpu_group)
+            logger.info(f'[FT] DP CPU group destroyed successfully')
+        else:
+            logger.warning("[FT] Cannot destroy DP CPU group: group not initialized (dynamic_eplb is enabled)")
         if get_ascend_config().eplb_config.dynamic_eplb:
-            stateless_destroy_torch_distributed_process_group(get_dynamic_eplb_group().cpu_group)
+            eplb_group = get_dynamic_eplb_group()
+            if eplb_group is not None and eplb_group.cpu_group is not None:
+                stateless_destroy_torch_distributed_process_group(eplb_group.cpu_group)
+                logger.info(f'[FT] EPLB CPU group destroyed successfully')
+            else:
+                logger.warning("[FT] Cannot destroy EPLB CPU group: group not initialized (dynamic_eplb is enabled)")
 
     def init_dp_cpu_group(self,new_stateless_dp_group_port,new_stateless_eplb_group_port) -> None:
         init_dp_cpu_group_impl(self.vllm_config,new_stateless_dp_group_port,new_stateless_eplb_group_port)
@@ -648,28 +660,34 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig,new_stateless_dp_group_port,n
     timeout = timedelta(seconds=vllm_config.parallel_config.cpu_distributed_timeout_seconds)
 
     if get_ascend_config().eplb_config.dynamic_eplb:
-        get_dynamic_eplb_group().cpu_group = stateless_init_torch_distributed_process_group(
+        eplb_group = get_dynamic_eplb_group()
+        if eplb_group is not None:
+            eplb_group.cpu_group = stateless_init_torch_distributed_process_group(
+                vllm_config.parallel_config.data_parallel_master_ip,
+                new_stateless_eplb_group_port,
+                vllm_config.parallel_config.data_parallel_rank,
+                vllm_config.parallel_config.data_parallel_size,
+                backend="gloo",
+            )
+            _set_pg_timeout(timeout=timeout, group=eplb_group.cpu_group)
+            logger.info(f'[FT] EPLB CPU group initialized successfully')
+        else:
+            logger.warning("[FT] Cannot initialize EPLB CPU group: group not initialized (dynamic_eplb is enabled)")
+
+    dp_group = get_dp_group()
+    if dp_group is not None:
+        dp_group.cpu_group = stateless_init_torch_distributed_process_group(
             vllm_config.parallel_config.data_parallel_master_ip,
-            new_stateless_eplb_group_port,
+            new_stateless_dp_group_port,
             vllm_config.parallel_config.data_parallel_rank,
             vllm_config.parallel_config.data_parallel_size,
             backend="gloo",
         )
-        _set_pg_timeout(timeout=timeout, group=get_dynamic_eplb_group().cpu_group)
+        _set_pg_timeout(timeout=timeout, group=dp_group.cpu_group)
+        logger.info(f'[FT] DP CPU group initialized successfully')
+    else:
+        logger.warning("[FT] Cannot initialize DP CPU group: group not initialized ")
 
-    get_dp_group().cpu_group = stateless_init_torch_distributed_process_group(
-        vllm_config.parallel_config.data_parallel_master_ip,
-        new_stateless_dp_group_port,
-        vllm_config.parallel_config.data_parallel_rank,
-        vllm_config.parallel_config.data_parallel_size,
-        backend="gloo",
-    )
-    _set_pg_timeout(timeout=timeout, group=get_dp_group().cpu_group)
-
-
-    # for sock in listen_sockets:
-    #     with contextlib.suppress(OSError):
-    #         sock.close()
 
 
 @contextmanager
