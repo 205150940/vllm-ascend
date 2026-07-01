@@ -49,6 +49,10 @@ class WorkerSentinel:
         with set_current_vllm_config(self.worker.vllm_config):
             return run_method(self, ft_request.instruction, (ft_request,), {})
 
+    def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
+        """In vllm_ascend, `query_mask` has no practical significance"""
+        return {"mask": get_ep_group().world_size * [0]}
+
     def retry(self, ft_request: FaultToleranceRequest):
         torch.accelerator.synchronize()
         params = ft_request.params
@@ -92,10 +96,8 @@ class WorkerSentinel:
 
         num_logical_expert = self.worker.num_logical_expert
 
-        enable_d2d_rebalance = (
-            self.worker.vllm_config.parallel_config.fault_tolerance_config.enable_fault_tolerance_rebalance
-        )
-        enable_d2d_rebalance = False
+        enable_d2d_rebalance = get_ascend_config().enable_d2d_rebalance
+
         if self.worker.model_runner.shared_dict["moe_load"] is None or torch.all(
                 self.worker.model_runner.shared_dict["moe_load"][0] == 0
         ):
@@ -141,10 +143,7 @@ class WorkerSentinel:
         self.dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
         self.worker.model_runner.dp_size = self.dp_size
         self.worker.model_runner.dp_rank = self.dp_rank
-        print(
-            f"ep2dp_map is {self.worker.ep2dp_map} "
-            f"new_dp_rank is {new_dp_rank} "
-        )
+
         from vllm_ascend.worker.sentinel.scale_down import get_mapping
         rank_mapping = get_mapping(removed_dp_ranks, new_dp_size)
         self.worker.ep2dp_map = scale_down_helper.update_ep2dp_map(
@@ -169,7 +168,7 @@ class WorkerSentinel:
         torch_npu.npu.stop_device(self.device.index)
         torch_npu.npu.restart_device(self.device.index)
         torch_npu.distributed.reinit_process_group(None, False)
-        # torch_npu.synchronize()
+        torch.npu.synchronize()
         self.worker.model_runner.execute_model_state = None
         self.worker.model_runner.kv_connector_output = None
         input_batch = self.worker.model_runner.input_batch
