@@ -205,6 +205,14 @@ class AscendConfig:
             ascend_envs.VLLM_ASCEND_OPERATOR_TIMEOUT,
         )
 
+        # D2D rebalance configuration for fault tolerance
+        self.enable_d2d_rebalance = self._get_config_value(
+            additional_config,
+            "enable_d2d_rebalance",
+            "VLLM_ASCEND_ENABLE_D2D_REBALANCE",
+            False
+        )
+
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1
         self.num_head_replica = 1
