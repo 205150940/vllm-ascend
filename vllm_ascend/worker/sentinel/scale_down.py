@@ -343,13 +343,16 @@ class ScaleDownHelper:
         self.model_runner = model_runner
         self.quant = quant
 
-    def get_expert_distribution_after_scale_down(self, excluded_dp_ranks, enable_d2d_rebalance, rank):
+    def get_expert_distribution_after_scale_down(self, excluded_dp_ranks, enable_d2d_rebalance, dp_rank):
         """Wake up EPLB worker and get the new expert distribution for this rank."""
         model_runner = self.model_runner
         eplb_updator = model_runner.eplb_updator
         model_runner.shared_dict["scale_down"] = True
         model_runner.shared_dict["enable_d2d_after_failure"] = enable_d2d_rebalance
         model_runner.shared_dict["excluded_dp_ranks"] = excluded_dp_ranks
+        # EPLB worker operates in EP-rank space; expose tp_size so it can expand
+        # excluded_dp_ranks → excluded EP ranks before feeding the policy.
+        model_runner.shared_dict["tp_size"] = self.vllm_config.parallel_config.tensor_parallel_size
         expert_maps = model_runner.shared_dict["expert_maps"]
         if expert_maps is None or (expert_maps.shape == (1, 1, 1) and not expert_maps.any()):
             model_runner.shared_dict["expert_maps"] = self._get_global_expert_map()
@@ -358,9 +361,14 @@ class ScaleDownHelper:
         eplb_updator.update_info_all = eplb_updator.eplb_process.block_update_q.get()
         need_load_h2d = model_runner.shared_dict["need_load_h2d"]
 
+        # need_load_h2d is indexed by EP rank; convert dp_rank → ep_rank for TP>1
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        tp_rank = get_tp_group().rank_in_group
+        ep_rank = dp_rank * tp_size + tp_rank
+
         experts_to_load = []
         for layer_id in range(len(need_load_h2d)):
-            per_layer = need_load_h2d[layer_id][rank].copy()
+            per_layer = need_load_h2d[layer_id][ep_rank].copy()
             experts_to_load.append(per_layer)
 
         return experts_to_load

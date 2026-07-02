@@ -229,7 +229,10 @@ class NPUWorkerSentinel(BaseSentinel):
         if enable_d2d_rebalance:
             all_layer_log2phy = scale_down_helper.d2d_transmission_for_scaling_down()
         else:
-            all_layer_log2phy = scale_down_helper.gen_all_layer_log2phy(new_dp_rank)
+            # expert_maps is indexed by EP rank; convert dp_rank → ep_rank for TP>1
+            tp_rank = get_tp_group().rank_in_group
+            new_ep_rank = new_dp_rank * tp_size + tp_rank
+            all_layer_log2phy = scale_down_helper.gen_all_layer_log2phy(new_ep_rank)
 
         self.worker.global_experts_distribution = self.worker.model_runner.eplb_process.worker.local2global(
             self.worker.model_runner.shared_dict["expert_maps"]

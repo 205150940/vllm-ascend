@@ -283,7 +283,14 @@ class EplbWorker:
 
     def trigger_fault_redeployment(self, load_info, old_placement, exclude_dp_ranks, enable_d2d_after_failure):
         policy = PolicyFactory.generate_policy(4, DynamicConfig())
-        policy.failed_cards = exclude_dp_ranks
+        # policy.rebalance_experts masks rank_indices = arange(ep_size) with
+        # failed_cards, so failed_cards must be EP ranks. Expand DP ranks →
+        # EP ranks: dp_rank d owns EP ranks [d*tp, (d+1)*tp).
+        tp_size = self.shared_dict.get("tp_size", 1)
+        exclude_ep_ranks = [
+            ep for dp in exclude_dp_ranks for ep in range(dp * tp_size, (dp + 1) * tp_size)
+        ]
+        policy.failed_cards = exclude_ep_ranks
         policy.enable_d2d_after_failure = enable_d2d_after_failure
         policy.rank_id_to_node_id = self.rank_id_to_node_id
 
