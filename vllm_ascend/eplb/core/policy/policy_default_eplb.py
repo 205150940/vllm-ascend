@@ -311,7 +311,6 @@ class DefaultEplb(EplbPolicy):
         if num_npus <= 0:
             raise ValueError("the number of NPUs must be greater than 0")
 
-
         # Number of experts deployed on each card includes one redundant expert
         global_deployment: list[list[list[int]]] = [[[] for _ in range(num_npus)] for _ in range(layer_num)]
         # Iterate to obtain the placement strategy for each layer, taking computational balance into account

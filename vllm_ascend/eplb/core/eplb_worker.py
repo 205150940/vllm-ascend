@@ -335,7 +335,6 @@ class EplbWorker:
 
         return workload_new
 
-
     def update_rank_id(self, exclude_dp_ranks: list[int]):
         unique_fault_ids = sorted(list(set(exclude_dp_ranks)))
         fault_count = 0

@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import weakref
 from collections import deque
@@ -194,7 +195,7 @@ class AscendWorkerProc(WorkerProc):
         daemon_mode = not (
             os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
             or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
-            or os.getenv("FAULT_EPLB_ENABLE","false").lower() in ("true", "1")
+            or os.getenv("FAULT_EPLB_ENABLE", "false").lower() in ("true", "1")
             or vllm_config.parallel_config.enable_fault_tolerance
         )
         # Run EngineCore busy loop in background process.

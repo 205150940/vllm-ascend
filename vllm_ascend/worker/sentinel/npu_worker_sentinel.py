@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import torch
-from datetime import timedelta
 from torch.distributed.distributed_c10d import _set_pg_timeout
 from vllm.config import set_current_vllm_config
 from vllm.distributed import (
@@ -11,14 +11,15 @@ from vllm.distributed import (
     get_ep_group,
     stateless_destroy_torch_distributed_process_group,
     stateless_init_torch_distributed_process_group,
-    get_cached_tcp_store_client
 )
 from vllm.logger import init_logger
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.serial_utils import run_method
-from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_elastic_info
+from vllm_ascend.worker.sentinel.scale_down import ScaleDownHelper
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
@@ -99,7 +100,7 @@ class WorkerSentinel:
         enable_d2d_rebalance = get_ascend_config().enable_d2d_rebalance
 
         if self.worker.model_runner.shared_dict["moe_load"] is None or torch.all(
-                self.worker.model_runner.shared_dict["moe_load"][0] == 0
+            self.worker.model_runner.shared_dict["moe_load"][0] == 0
         ):
             enable_d2d_rebalance = False
 
@@ -138,13 +139,14 @@ class WorkerSentinel:
 
         # Phase 5: Configuration and state update
         old_ep_size = len(self.worker.ep2dp_map)
-        scale_down_helper.update_parallel_config(new_dp_size,new_dp_rank,new_stateless_dp_group_port)
+        scale_down_helper.update_parallel_config(new_dp_size, new_dp_rank, new_stateless_dp_group_port)
         self.dp_size = self.worker.vllm_config.parallel_config.data_parallel_size
         self.dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
         self.worker.model_runner.dp_size = self.dp_size
         self.worker.model_runner.dp_rank = self.dp_rank
 
         from vllm_ascend.worker.sentinel.scale_down import get_mapping
+
         rank_mapping = get_mapping(removed_dp_ranks, new_dp_size)
         self.worker.ep2dp_map = scale_down_helper.update_ep2dp_map(
             self.worker.ep2dp_map, removed_dp_ranks, rank_mapping
@@ -156,14 +158,16 @@ class WorkerSentinel:
         # Phase 6: Communication group reinitialization
         scale_down_helper.destroy_comm_group()
         with set_current_vllm_config(self.worker.vllm_config):
-            scale_down_helper.init_dp_cpu_group(new_stateless_dp_group_port,new_stateless_eplb_group_port)
+            scale_down_helper.init_dp_cpu_group(new_stateless_dp_group_port, new_stateless_eplb_group_port)
 
         # Phase 7: MoE reconfiguration
         scale_down_helper.reconfigure_moe(num_logical_expert, num_new_phy_experts, all_layer_log2phy)
 
     def _clean_worker_state(self):
         import torch_npu
+
         from vllm_ascend.platform import NPUPlatform
+
         NPUPlatform.set_device(self.device)
         torch_npu.npu.stop_device(self.device.index)
         torch_npu.npu.restart_device(self.device.index)

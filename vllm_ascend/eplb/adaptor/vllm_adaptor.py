@@ -212,6 +212,9 @@ class VllmEplbAdaptor:
         return torch.stack(all_layer_global_expert_map)
 
     def get_concat_expert_map(self):
-        tensor_list = [self.global_expert_map_per_layer_cpu[layer_id + self.num_dense_layers] for layer_id in range(self.num_moe_layers)]
+        tensor_list = [
+            self.global_expert_map_per_layer_cpu[layer_id + self.num_dense_layers]
+            for layer_id in range(self.num_moe_layers)
+        ]
         cur_global_expert_map = torch.stack(tensor_list)
         return cur_global_expert_map
