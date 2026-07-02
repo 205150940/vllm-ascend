@@ -37,6 +37,40 @@ def evaluate_pause_condition() -> None:
         raise EngineLoopPausedError("Worker is paused as a fault was detected on another rank.")
 
 
+def _ep_ranks_to_dp_ranks(
+    excluded_ep_ranks: list[int],
+    ep2dp_map: dict[int, int],
+    tp_size: int,
+) -> list[int]:
+    """Map failed EP ranks to the affected DP ranks.
+
+    In vllm-ascend's fault tolerance model, the DP rank is the minimum unit
+    of failure.  Each DP rank owns ``tp_size`` EP ranks (one per NPU in the
+    TP group).  When *any* NPU within a DP rank fails, the entire DP rank
+    is taken offline — the healthy NPUs in the same TP group are sacrificed.
+
+    Args:
+        excluded_ep_ranks: List of failed EP rank IDs.
+        ep2dp_map: Mapping from EP rank → DP rank.  With TP=1 this is a
+            simple one-to-one mapping; with TP>1 every ``tp_size``
+            consecutive EP ranks map to the same DP rank.
+        tp_size: Tensor-parallel size (number of NPUs per DP rank).
+
+    Returns:
+        Deduplicated list of DP rank IDs that should be excluded.
+    """
+    affected_dp_ranks: set[int] = set()
+    for ep in excluded_ep_ranks:
+        dp = ep2dp_map.get(ep)
+        if dp is not None and dp != -1:
+            affected_dp_ranks.add(dp)
+            logger.info(
+                "EP rank %d failure → DP rank %d affected (tp_size=%d)",
+                ep, dp, tp_size,
+            )
+    return sorted(affected_dp_ranks)
+
+
 class NPUWorkerSentinel(BaseSentinel):
     def __init__(
         self,
@@ -165,10 +199,13 @@ class NPUWorkerSentinel(BaseSentinel):
             enable_d2d_rebalance = False
 
         scale_down_helper = ScaleDownHelper(self.worker.vllm_config, self.worker.model_runner, self.worker.quant)
-        # Currently,only TP=1 is supported.Therefore excluded_dp_ranks = excluded_ep_ranks
-        # TODO: In scenarios TP>1,the logic for converting from
-        #  excluded_ep_ranks to excluded_dp_ranks needs to be added
-        excluded_dp_ranks = excluded_ep_ranks
+
+        tp_size = self.worker.vllm_config.parallel_config.tensor_parallel_size
+        excluded_dp_ranks = _ep_ranks_to_dp_ranks(excluded_ep_ranks, self.worker.ep2dp_map, tp_size)
+        logger.info(
+            "Scale-down mapping: tp_size=%d, excluded_ep_ranks=%s -> excluded_dp_ranks=%s",
+            tp_size, excluded_ep_ranks, excluded_dp_ranks,
+        )
 
         # Phase 1: Expert distribution recalculation
         experts_to_load = scale_down_helper.get_expert_distribution_after_scale_down(

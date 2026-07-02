@@ -263,7 +263,7 @@ def init_elastic_info(
     # Table2: localEpRankId -> epRankID(-1 indicates padding）
     table2 = torch.arange(0, ep_size, dtype=torch.int32)
 
-    elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().contiguous()
+    elastic_info = torch.cat([base_config, table1, table2], dim=0).npu().to(f"npu:{torch.npu.current_device()}").contiguous()
     elastic_info.requires_grad_(False)
     set_elastic_info(elastic_info)
 
@@ -276,7 +276,7 @@ def update_elastic_info(
     share_expert_num: int = 0,
 ) -> None:
     if elastic_info is None:
-        elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().contiguous()
+        elastic_info = torch.full((4 + 2 * raw_ep_size,), -1, dtype=torch.int32).npu().to(f"npu:{torch.npu.current_device()}").contiguous()
     raw_ep_ranks = sorted(ep2dp.keys())
     valid_ep_ranks = [ep for ep in raw_ep_ranks if ep2dp[ep] != -1]
     scaled_down_ep_size = len(valid_ep_ranks)
