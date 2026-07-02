@@ -1,25 +1,21 @@
-import contextlib
-import socket
-import struct
 from contextlib import contextmanager
 from copy import copy
 from datetime import timedelta
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch_npu
 from torch.distributed.distributed_c10d import _set_pg_timeout
-from vllm.config import VllmConfig
+from vllm.config import SchedulerConfig, VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_pcp_group,
     get_tp_group,
-    stateless_init_torch_distributed_process_group, stateless_destroy_torch_distributed_process_group,
+    stateless_destroy_torch_distributed_process_group,
+    stateless_init_torch_distributed_process_group,
 )
-from vllm.distributed.parallel_state import _get_unique_name
 from vllm.logger import logger
-from vllm.config import SchedulerConfig
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 from vllm.model_executor.model_loader import get_model_loader
@@ -232,7 +228,6 @@ def update_ep2dp_map(
 
 
 def update_parallel_config(original_config: VllmConfig, new_dp_size, new_dp_rank, new_stateless_dp_group_port) -> None:
-
     original_config.parallel_config.data_parallel_size = new_dp_size
     original_config.parallel_config.data_parallel_rank = new_dp_rank
     original_config.parallel_config.data_parallel_master_port = new_stateless_dp_group_port
@@ -558,6 +553,7 @@ class ScaleDownHelper:
         model_runner.eplb_loader.updated_expert_map = None
         model_runner.eplb_loader.layer_id = -1
         from vllm_ascend.eplb.core.eplb_device_transfer_loader import ExpertWeightUpdateState
+
         model_runner.eplb_loader.state = ExpertWeightUpdateState.WAITING
 
         if num_add_experts_per_rank > 0:
@@ -617,7 +613,7 @@ class ScaleDownHelper:
 
         return all_layer_log2phy_map
 
-    def update_parallel_config(self, new_dp_size,new_dp_rank,new_stateless_dp_group_port) -> None:
+    def update_parallel_config(self, new_dp_size, new_dp_rank, new_stateless_dp_group_port) -> None:
         update_parallel_config(self.vllm_config, new_dp_size, new_dp_rank, new_stateless_dp_group_port)
 
     def update_ep2dp_map(self, ep2dp_map, excluded_dp_ranks, rank_mapping):
@@ -630,19 +626,19 @@ class ScaleDownHelper:
         dp_group = get_dp_group()
         if dp_group is not None and dp_group.cpu_group is not None:
             stateless_destroy_torch_distributed_process_group(get_dp_group().cpu_group)
-            logger.info(f'[FT] DP CPU group destroyed successfully')
+            logger.info("[FT] DP CPU group destroyed successfully")
         else:
             logger.warning("[FT] Cannot destroy DP CPU group: group not initialized (dynamic_eplb is enabled)")
         if get_ascend_config().eplb_config.dynamic_eplb:
             eplb_group = get_dynamic_eplb_group()
             if eplb_group is not None and eplb_group.cpu_group is not None:
                 stateless_destroy_torch_distributed_process_group(eplb_group.cpu_group)
-                logger.info(f'[FT] EPLB CPU group destroyed successfully')
+                logger.info("[FT] EPLB CPU group destroyed successfully")
             else:
                 logger.warning("[FT] Cannot destroy EPLB CPU group: group not initialized (dynamic_eplb is enabled)")
 
-    def init_dp_cpu_group(self,new_stateless_dp_group_port,new_stateless_eplb_group_port) -> None:
-        init_dp_cpu_group_impl(self.vllm_config,new_stateless_dp_group_port,new_stateless_eplb_group_port)
+    def init_dp_cpu_group(self, new_stateless_dp_group_port, new_stateless_eplb_group_port) -> None:
+        init_dp_cpu_group_impl(self.vllm_config, new_stateless_dp_group_port, new_stateless_eplb_group_port)
 
     def reconfigure_moe(self, num_logical_expert, num_new_phy_experts, all_layer_log2phy):
         reconfigure_moe(
@@ -654,7 +650,7 @@ class ScaleDownHelper:
         )
 
 
-def init_dp_cpu_group_impl(vllm_config: VllmConfig,new_stateless_dp_group_port,new_stateless_eplb_group_port) -> None:
+def init_dp_cpu_group_impl(vllm_config: VllmConfig, new_stateless_dp_group_port, new_stateless_eplb_group_port) -> None:
     """Initialize DP CPU group using TCP store for port coordination."""
 
     timeout = timedelta(seconds=vllm_config.parallel_config.cpu_distributed_timeout_seconds)
@@ -670,7 +666,7 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig,new_stateless_dp_group_port,n
                 backend="gloo",
             )
             _set_pg_timeout(timeout=timeout, group=eplb_group.cpu_group)
-            logger.info(f'[FT] EPLB CPU group initialized successfully')
+            logger.info("[FT] EPLB CPU group initialized successfully")
         else:
             logger.warning("[FT] Cannot initialize EPLB CPU group: group not initialized (dynamic_eplb is enabled)")
 
@@ -684,10 +680,9 @@ def init_dp_cpu_group_impl(vllm_config: VllmConfig,new_stateless_dp_group_port,n
             backend="gloo",
         )
         _set_pg_timeout(timeout=timeout, group=dp_group.cpu_group)
-        logger.info(f'[FT] DP CPU group initialized successfully')
+        logger.info("[FT] DP CPU group initialized successfully")
     else:
         logger.warning("[FT] Cannot initialize DP CPU group: group not initialized ")
-
 
 
 @contextmanager
@@ -739,8 +734,6 @@ def reconfigure_moe(
     num_global_new_phy_experts: int,
     log2phy: torch.Tensor,
 ):
-    import vllm.envs as envs
-
     parallel_config = vllm_config.parallel_config
     new_ep_size = parallel_config.data_parallel_size * parallel_config.tensor_parallel_size
     get_ascend_config().eplb_config.num_redundant_experts = num_global_new_phy_experts - num_global_logical_experts
@@ -785,12 +778,8 @@ def reconfigure_moe(
         module.moe_config.global_redundant_expert_num = module.global_redundant_expert_num
         module.log2phy.copy_(log2phy[cur_layer_id].npu(), non_blocking=True)
 
+
 def get_mapping(removed_dp_ranks: list[int], new_dp_size: int):
     to_remove_set = set(removed_dp_ranks)
     original_list = range(new_dp_size + len(removed_dp_ranks))
-    return {
-        original: new
-        for new, original in enumerate(
-            num for num in original_list if num not in to_remove_set
-        )
-    }
+    return {original: new for new, original in enumerate(num for num in original_list if num not in to_remove_set)}

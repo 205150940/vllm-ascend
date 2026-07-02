@@ -188,10 +188,7 @@ class AscendConfig:
 
         # D2D rebalance configuration for fault tolerance
         self.enable_d2d_rebalance = self._get_config_value(
-            additional_config,
-            "enable_d2d_rebalance",
-            "VLLM_ASCEND_ENABLE_D2D_REBALANCE",
-            False
+            additional_config, "enable_d2d_rebalance", "VLLM_ASCEND_ENABLE_D2D_REBALANCE", False
         )
 
         self.pd_tp_ratio = 1

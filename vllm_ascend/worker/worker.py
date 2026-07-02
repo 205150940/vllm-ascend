@@ -214,7 +214,6 @@ class NPUWorker(WorkerBase):
             self.model_loaded = False
             init_elastic_info(ep_size, self.num_logical_expert + num_redundant_experts)
 
-
     def handle_ft_command(self, ft_request):
         assert self.worker_sentinel is not None
         return self.worker_sentinel.handle_command(ft_request)
@@ -435,6 +434,7 @@ class NPUWorker(WorkerBase):
         torch.npu.set_device(device)
         if self.parallel_config.enable_fault_tolerance:
             import torch_npu
+
             torch_npu.npu.set_op_timeout_ms(get_ascend_config().operator_timeout_ms)
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -744,7 +744,7 @@ class NPUWorker(WorkerBase):
             drafter = getattr(self.model_runner, "drafter_model", None)
             drafter_model = getattr(drafter, "model", None)
             with patch_get_all_weights(
-                    self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
+                self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
             ):
                 self.model_runner.load_model()
 

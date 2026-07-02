@@ -4,7 +4,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from .policy_abstract import  EplbPolicy
+from .policy_abstract import EplbPolicy
 
 
 class DynamicTable:
@@ -38,7 +38,6 @@ class FaultRearrangement(EplbPolicy):
         self.enable_d2d_after_failure = False
         self.rank_id_to_node_id = None
         self.update_layer_id = -1
-
 
     def constraint_expert_local_exchange(
         self, old_deployment: np.ndarray, new_deployment: np.ndarray
@@ -80,7 +79,6 @@ class FaultRearrangement(EplbPolicy):
     def rebalance_experts(
         self, current_expert_table: torch.Tensor, expert_workload: np.ndarray
     ) -> tuple[list[list[list[int]]], list[list[list[int]]], list[defaultdict[int, list[tuple[int, int]]]], int]:
-
         self.org_deployment = current_expert_table.numpy()
 
         self.n_layer, self.n_org_cards, self.n_experts_per_card = self.org_deployment.shape
@@ -267,8 +265,7 @@ class FaultRearrangement(EplbPolicy):
             node_cards[node_id].sort(key=lambda c: (-len(redundant_expert_pos[c]), c))
 
         active_nodes = sorted(
-            node_cards.keys(),
-            key=lambda n: (-sum(len(redundant_expert_pos[c]) for c in node_cards[n]), n)
+            node_cards.keys(), key=lambda n: (-sum(len(redundant_expert_pos[c]) for c in node_cards[n]), n)
         )
         node_idx = 0
 
