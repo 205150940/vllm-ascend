@@ -754,8 +754,11 @@ class NPUWorker(WorkerBase):
             with patch_get_all_weights(
                 self.weight_name_to_tensor, self.vllm_config.parallel_config.enable_fault_tolerance, drafter_model
             ):
-                self.model_runner.load_model()
+                self.model_runner.load_model(load_dummy_weights)
 
+        self.model_runner.eplb_warmup()
+        if self.parallel_config.enable_elastic_ep:
+            self.elastic_ep_executor.init_eplb_manager()
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
                 WeightTransferEngineFactory,
