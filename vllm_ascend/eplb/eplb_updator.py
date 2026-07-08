@@ -32,8 +32,14 @@ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 
 
 class EplbUpdator:
-    def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process,
-                 enable_elastic_ep: bool = False):
+    def __init__(
+        self,
+        eplb_config,
+        loader: D2DExpertWeightLoader,
+        eplb_process: EplbProcess,
+        process,
+        enable_elastic_ep: bool = False,
+    ):
         self.eplb_config = eplb_config
         self.multi_stage = eplb_config.eplb_policy_type == 3
         self._enable_elastic_ep = enable_elastic_ep
