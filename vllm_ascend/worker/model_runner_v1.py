@@ -3640,6 +3640,7 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
