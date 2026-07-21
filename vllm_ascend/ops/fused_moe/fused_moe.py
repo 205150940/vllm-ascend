@@ -411,7 +411,7 @@ else:
             routed_experts.expert_map_manager._local_num_experts = local_num_experts
             routed_experts.expert_map_manager._expert_map = self._expert_map
 
-            self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
+            self.dynamic_eplb = eplb_config.dynamic_eplb
             self.multi_stage = False
             self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64).npu()
             if self.dynamic_eplb and eplb_config.expert_heat_collection_interval > 1:
