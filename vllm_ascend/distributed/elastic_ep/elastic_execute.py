@@ -71,28 +71,12 @@ from vllm_ascend.distributed.elastic_ep.eplb_manager import ElasticEplbManager
 _PATCH_LOCK = threading.Lock()
 
 
-def make_p2p_ops(params: List[torch.Tensor]):
-    assert len(params) > 0
-    p2p_ops = []
-    for param in params:
-        op = object.__new__(P2POp)
-        if is_sender:
-            op.op = torch.distributed.isend
-            op.tensor = param
-        else:
-            op.op = torch.distributed.irecv
-            op.tensor = param
-        op.group_peer = peer_rank
-        p2p_ops.append(op)
-
-    return p2p_ops
-
-
 def ascend_batch_transfer_weights(
     model: nn.Module,
     is_sender: bool,
     peer_rank: int,
     dp_group: StatelessGroupCoordinator,
+    expert_weights: Sequence[Iterable[torch.Tensor]],
 ) -> None:
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
@@ -103,9 +87,10 @@ def ascend_batch_transfer_weights(
     all_params = []
     all_params_ptrs = set()
     all_params_name = []
+    expert_map_params = []
 
     for name, param in state_dict.items():
-        if "experts" in name:
+        if name.endswith("expert_map"):
             continue
         ptr = param.data_ptr()
         if ptr not in expert_weights_set and ptr not in all_params_ptrs:
@@ -114,9 +99,11 @@ def ascend_batch_transfer_weights(
                 all_params_ptrs.add(ptr)
                 all_params_name.append(name)
 
-    def handle_sub_module(submodule, submodule_name, skip_experts=True):
-        if skip_experts and submodule_name.endswith("experts"):
-            return
+    def handle_sub_module(submodule, submodule_name):
+        if (expert_map := getattr(submodule, "expert_map", None)) is not None:
+            if isinstance(expert_map, torch.Tensor):
+                expert_map_params.append((expert_map.npu(), expert_map))
+                all_params_name.append(submodule_name + "." + "expert_map")
         for attr_name, attr_value in submodule.__dict__.items():
             if isinstance(attr_value, torch.Tensor):
                 data_ptr = attr_value.data_ptr()
@@ -131,12 +118,6 @@ def ascend_batch_transfer_weights(
     for module_name, module in model.named_modules():
         handle_sub_module(module, module_name)
 
-    expert_map_params = []
-    for module_name, module in model.named_modules():
-        if (expert_map := getattr(module, "expert_map", None)) is not None:
-            if isinstance(expert_map, torch.Tensor):
-                expert_map_params.append((expert_map.npu(), expert_map))
-                all_params_name.append(module_name + "." + "expert_map")
     all_params.extend([npu_tensor for npu_tensor, _ in expert_map_params])
 
     if is_sender:
@@ -151,18 +132,23 @@ def ascend_batch_transfer_weights(
         ids = [all_params_name.index(name) for name in common]
         all_params = [param for idx, param in enumerate(all_params) if idx in ids]
 
-    device_comm.batch_isend_irecv(make_p2p_ops(all_params))
+    assert len(all_params) > 0
+    p2p_ops = []
+    for param in all_params:
+        op = object.__new__(P2POp)
+        if is_sender:
+            op.op = torch.distributed.isend
+            op.tensor = param
+        else:
+            op.op = torch.distributed.irecv
+            op.tensor = param
+        op.group_peer = peer_rank
+        p2p_ops.append(op)
+
+    device_comm.batch_isend_irecv(p2p_ops)
 
     for npu_tensor, cpu_tensor in expert_map_params:
         cpu_tensor.copy_(npu_tensor)
-
-    all_params = []
-    all_params_name = []
-    all_params_ptrs = set()
-    for module_name, module in model.named_modules():
-        if module_name.endswith("experts"):
-            handle_sub_module(module, module_name, skip_experts=False)
-            device_comm.batch_isend_irecv(make_p2p_ops(all_params))
 
 
 def broadcast_expert_mapping(
