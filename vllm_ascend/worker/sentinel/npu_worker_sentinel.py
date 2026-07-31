@@ -57,9 +57,9 @@ class WorkerSentinel:
         return {"mask": get_ep_group().world_size * [0]}
 
     def retry(self, ft_request: FaultToleranceRequest):
+        self._clean_worker_state()
         torch.accelerator.synchronize()
         params = ft_request.params
-        self._clean_worker_state()
         if self.dp_size > 1:
             old_cpu_group = get_dp_group().cpu_group
             stateless_destroy_torch_distributed_process_group(old_cpu_group)

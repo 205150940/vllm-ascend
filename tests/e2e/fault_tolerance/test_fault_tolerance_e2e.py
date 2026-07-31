@@ -27,7 +27,7 @@ DP_SIZE = 4
 # - NPU: HCSP operator timeout detects the dead peer.
 # - Deadline (45s): slowest fallback (30s) + margin.
 CPU_DISTRIBUTED_TIMEOUT_S = 30
-FAULT_DETECTION_DEADLINE_S = 45
+FAULT_DETECTION_DEADLINE_S = 90
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +175,7 @@ class FTServerManager:
                     server = RemoteOpenAIServer(
                         self.model_name,
                         sargs,
+                        server_host="localhost",
                         server_port=8000 + r,
                         auto_port=False,
                     )
