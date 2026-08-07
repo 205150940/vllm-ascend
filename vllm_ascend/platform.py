@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import timedelta
 from importlib import import_module, util
 from typing import TYPE_CHECKING, Any, get_args
 from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
+from torch.distributed.distributed_c10d import Backend, BackendConfig, PrefixStore, ProcessGroup, _world
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -696,6 +698,84 @@ class NPUPlatform(Platform):
             "dynamic_mx_quant_scale_alg": dynamic_mx_quant_scale_alg,
         }
 
+    @classmethod
+    def stateless_init_device_torch_dist_pg(
+        cls,
+        backend: str,
+        prefix_store: PrefixStore,
+        group_rank: int,
+        group_size: int,
+        timeout: timedelta,
+    ) -> ProcessGroup:
+        """
+        Create a stateless HCCL ProcessGroup for Ascend NPU.
+        Uses internal torch_npu API (ProcessGroupHCCL) which may break on upgrade.
+        """
+        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
+        import uuid
+
+        pg = ProcessGroup(prefix_store, group_rank, group_size)
+
+        backend_options = ProcessGroupHCCL.Options()
+        backend_options._timeout = timeout
+
+        # Create Backend object
+        backend = Backend("hccl")
+
+        # Set default backend for ProcessGroup
+        pg._set_default_backend(Backend.backend_type_map[backend])
+
+        device = torch.device("npu")
+        if hasattr(backend_options, "_device"):
+            backend_options._device = device
+
+        backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
+
+        backend_class._set_sequence_number_for_group()
+        backend_type = ProcessGroup.BackendType.CUSTOM
+        pg._register_backend(device, backend_type, backend_class)
+        if group_rank == 0:
+            hccl_comm_name = uuid.uuid4().hex
+            pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
+        else:
+            hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
+        if hccl_comm_name is not None:
+            group_desc = "undefined"
+            backend_class._set_hccl_comm_name(hccl_comm_name)
+            pg._set_group_desc(group_desc)
+
+        return pg
+
+    @classmethod
+    def on_stateless_process_group_created(
+        cls,
+        pg: ProcessGroup,
+        group_ranks: list[int],
+        backend: str,
+    ) -> None:
+        # Register the stateless group in torch's global ``_world``: the
+        # gloo staged EPLB communicator and the MegaMoe symm-buffer
+        # handshake resolve ranks via torch.distributed module-level APIs
+        # (``dist.get_rank(group=...)``), which need the entry. Elastic
+        # group members are not contiguous global ranks, so register the
+        # real {global_rank: group_rank} translation, not an identity map.
+        rank_map = {global_rank: idx for idx, global_rank in enumerate(group_ranks)}
+        _world.pg_group_ranks[pg] = rank_map
+        _world.pg_map[pg] = (backend, pg.get_group_store())
+        _world.pg_names[pg] = pg.group_name
+        _world.pg_backend_config[pg] = str(BackendConfig(backend))
+
+    @classmethod
+    def on_stateless_process_group_destroyed(cls, pg: ProcessGroup) -> None:
+        # Mirror of on_stateless_process_group_created, invoked by
+        # StatelessGroupCoordinator.destroy before the PG shuts down; stale
+        # entries would otherwise keep the PG (and its HCCL/gloo comms)
+        # alive across elastic scaling rounds. Idempotent.
+        _world.pg_map.pop(pg, None)
+        _world.pg_names.pop(pg, None)
+        _world.pg_group_ranks.pop(pg, None)
+        _world.pg_backend_config.pop(pg, None)
+
 
 def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
     """Keep MiniMax-M3 GQA KV cache in BF16 on the A5 FP8 path."""
@@ -1018,21 +1098,30 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl"):
-                raise ValueError(
-                    "Async EPLB on Ascend requires the torch_gloo or hixl communicator "
-                    f"but got {upstream_eplb_config.communicator!r}. "
-                    "Set eplb_config.communicator to 'torch_gloo' or 'hixl'."
-                )
-            if not upstream_eplb_config.use_async:
-                logger.warning(
-                    "Synchronous EPLB is not supported on Ascend; "
-                    "parameter=eplb_config.use_async, value=False, "
-                    "action: forcing asynchronous EPLB."
-                )
-                upstream_eplb_config.use_async = True
             if vllm_config.parallel_config.enable_elastic_ep:
-                raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
+                if upstream_eplb_config.use_async:
+                    raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
+                if upstream_eplb_config.communicator not in (None, "pynccl"):
+                    raise ValueError(
+                        "Elastic EP on Ascend requires the pynccl communicator "
+                        f"(PyHccl-backed), but got {upstream_eplb_config.communicator!r}."
+                    )
+                upstream_eplb_config.communicator = "pynccl"
+            else:
+                if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl"):
+                    raise ValueError(
+                        "Async EPLB on Ascend requires the torch_gloo or hixl communicator "
+                        f"but got {upstream_eplb_config.communicator!r}. "
+                        "Set eplb_config.communicator to 'torch_gloo' or 'hixl'."
+                    )
+                if not upstream_eplb_config.use_async:
+                    logger.warning(
+                        "Synchronous EPLB is not supported on Ascend; "
+                        "parameter=eplb_config.use_async, value=False, "
+                        "action: forcing asynchronous EPLB."
+                    )
+                    upstream_eplb_config.use_async = True
+                    upstream_eplb_config.communicator = "torch_gloo"
     elif {"load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
             "stair_config and load_collection_phase are only supported by Model Runner V2; "
