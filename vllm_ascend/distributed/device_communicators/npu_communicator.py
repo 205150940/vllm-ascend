@@ -18,6 +18,7 @@
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
+from vllm.distributed.utils import StatelessProcessGroup
 
 
 class _NpuAll2AllManager:
@@ -38,21 +39,97 @@ class _NpuAll2AllManager:
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
+    # main2main compat: `use_all2all` was added to upstream
+    # DeviceCommunicatorBase.__init__() in vllm main after 0.26.0.
+    # NPU does not support all2all (uses mc2 / all_gather for MoE),
+    # so the parameter is only accepted for interface alignment.
+    # Remove the version gate once 0.26.0 support is dropped.
+
     def __init__(
         self,
         cpu_group: dist.ProcessGroup,
         device: torch.device | None = None,
         device_group: dist.ProcessGroup | None = None,
         unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
-        super().__init__(
-            cpu_group,
-            device,
-            device_group,
-            unique_name,
-            use_all2all=use_all2all,
-        )
+        super().__init__(cpu_group, device, device_group, unique_name, global_ranks, global_world_size, use_all2all)
         self.device = torch.npu.current_device()
+
+        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
+
+        self.pyhccl_comm: PyHcclCommunicator | None = None
+        if self.world_size > 1 and tcp_store_group is not None:
+            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device, warmup=False)
+
         self.ca_comm = None
         self.all2all_manager = _NpuAll2AllManager()
+
+    def all_to_all(
+        self,
+        input_: torch.Tensor,
+        scatter_dim: int = 0,
+        gather_dim: int = -1,
+        scatter_sizes: list[int] | None = None,
+        gather_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        if scatter_dim < 0:
+            scatter_dim += input_.dim()
+        if gather_dim < 0:
+            gather_dim += input_.dim()
+
+        if scatter_sizes is not None and gather_sizes is not None:
+            input_list = [t.contiguous() for t in torch.split(input_, scatter_sizes, scatter_dim)]
+            output_list = []
+            tensor_shape_base = input_list[self.rank].size()
+            for i in range(self.world_size):
+                tensor_shape = list(tensor_shape_base)
+                tensor_shape[gather_dim] = gather_sizes[i]
+                output_list.append(torch.empty(tensor_shape, dtype=input_.dtype, device=input_.device))
+
+        else:
+            input_list = [t.contiguous() for t in torch.tensor_split(input_, self.world_size, scatter_dim)]
+            output_list = [torch.empty_like(input_list[i]) for i in range(self.world_size)]
+
+        dist.all_to_all(output_list, input_list, group=self.device_group)
+        output_tensor = torch.cat(output_list, dim=gather_dim).contiguous()
+        return output_tensor
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.pyhccl_comm is not None:
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
+            input_size = input_.size()
+            # NOTE: we have to use concat-style all-gather here,
+            # stack-style all-gather has compatibility issues with
+            # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+            output_size = (input_size[0] * self.world_size,) + input_size[1:]
+            # Allocate output tensor.
+            output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
+            # All-gather.
+            output_tensor = self.pyhccl_comm.all_gather(input_, output_tensor)
+            # Reshape
+            output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim] + (self.world_size * input_size[dim],) + input_size[dim + 1 :]
+            )
+            return output_tensor
+        else:
+            return super().all_gather(input_, dim)
+
+    def destroy(self):
+        if self.pyhccl_comm is not None:
+            self.pyhccl_comm.destroy()
+            self.pyhccl_comm = None
+
+    def batch_isend_irecv(self, p2p_ops: list):
+        pyhccl_comm = self.pyhccl_comm
+        if pyhccl_comm is not None and not pyhccl_comm.disabled:
+            pyhccl_comm.batch_isend_irecv(p2p_ops)
+        else:
+            raise ValueError("No PyHccl communicator found")
