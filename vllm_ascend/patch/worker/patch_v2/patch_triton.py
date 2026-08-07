@@ -32,6 +32,7 @@ from vllm_ascend.worker.v2.sample.gumbel import apply_temperature
 from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_logprobs
 from vllm_ascend.worker.v2.sample.min_p import apply_min_p
 from vllm_ascend.worker.v2.sample.penalties import apply_penalties, bincount
+from vllm_ascend.worker.v2.sample.topk_topp import apply_top_k_top_p as npu_apply_top_k_top_p
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _prepare_dflash_inputs_kernel_ascend
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
     rejection_sample as npu_rejection_sample,
