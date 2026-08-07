@@ -989,6 +989,21 @@ class AscendConfig:
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
 
+    def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep:
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise ValueError("Elastic EP is only supported on A3.")
+
+            if self.eplb_config.dynamic_eplb:
+                raise RuntimeError(
+                    "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
+                    "Set dynamic_eplb=False in eplb_config to use Elastic EP."
+                    "Or use EPLB in ModelRunnerV2 instead."
+                )
+
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
             raise NotImplementedError(
