@@ -48,8 +48,6 @@ import vllm_ascend.patch.platform.patch_eplb  # noqa
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
 import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
-import vllm_ascend.patch.platform.patch_elastic_ep  # noqa
-import vllm_ascend.patch.platform.patch_standby_state  # noqa
 import vllm_ascend.patch.platform.patch_stateless_coordinator  # noqa
 
 # ** File: platform/patch_kv_cache_utils.py **
