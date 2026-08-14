@@ -27,6 +27,8 @@ from vllm_ascend.distributed.device_communicators.int8_all_reduce import (
 )
 from vllm_ascend.distributed.device_communicators.mxfp8_all_reduce import Mxfp8AllReduce
 
+from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
+
 
 class _NpuAll2AllManager:
     """No-op all2all_manager for NPU. Used by vLLM main's fault-tolerance
@@ -63,10 +65,16 @@ class NPUCommunicator(DeviceCommunicatorBase):
         tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
-        super().__init__(cpu_group, device, device_group, unique_name, global_ranks, global_world_size, use_all2all)
+        super().__init__(
+            cpu_group,
+            device,
+            device_group,
+            unique_name,
+            global_ranks,
+            global_world_size,
+            use_all2all,
+        )
         self.device = torch.npu.current_device()
-
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
         self.pyhccl_comm: PyHcclCommunicator | None = None
         if self.world_size > 1 and tcp_store_group is not None:
@@ -149,9 +157,8 @@ class NPUCommunicator(DeviceCommunicatorBase):
                 # Convert negative dim to positive.
                 dim += input_.dim()
             input_size = input_.size()
-            # NOTE: we have to use concat-style all-gather here,
-            # stack-style all-gather has compatibility issues with
-            # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+            # Use concat-style all-gather: stack-style has torch.compile
+            # compatibility issues (pytorch/pytorch#138795).
             output_size = (input_size[0] * self.world_size,) + input_size[1:]
             # Allocate output tensor.
             output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
