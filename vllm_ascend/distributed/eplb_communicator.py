@@ -70,7 +70,6 @@ class PyHcclEplbCommunicator(EplbCommunicator):
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
-        # Ascend keeps each expert in an independent persistent tensor. The
-        # upstream profile collective expects every weight entry to be one
-        # stacked tensor, so reserve HCCL buffers during actual P2P transfers.
+        # Ascend experts live in independent tensors; reserve HCCL buffers
+        # during actual P2P transfers, not during profiling.
         return False
