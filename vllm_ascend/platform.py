@@ -628,12 +628,8 @@ class NPUPlatform(Platform):
         group_size: int,
         timeout: timedelta,
     ) -> ProcessGroup:
-        """
-        Create a stateless HCCL ProcessGroup for Ascend NPU.
-        Uses internal torch_npu API (ProcessGroupHCCL) which may break on upgrade.
-        """
+        """Create a stateless HCCL ProcessGroup"""
         from torch_npu._C._distributed_c10d import ProcessGroupHCCL
-        import uuid
 
         pg = ProcessGroup(prefix_store, group_rank, group_size)
 
@@ -656,7 +652,7 @@ class NPUPlatform(Platform):
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
         if group_rank == 0:
-            hccl_comm_name = uuid.uuid4().hex
+            hccl_comm_name = uuid4().hex
             pg.get_group_store().set("hccl_comm_name", hccl_comm_name)
         else:
             hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
@@ -666,10 +662,6 @@ class NPUPlatform(Platform):
             pg._set_group_desc(group_desc)
 
         return pg
-
-
-    elif vllm_config.parallel_config.enable_eplb:
-        raise ValueError("Upstream EPLB is only supported by Model Runner V2 on Ascend.")
 
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
