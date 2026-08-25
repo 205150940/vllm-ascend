@@ -381,7 +381,6 @@ class NPUWorker(WorkerBase):
                     "Fault tolerance with Model Runner V2 does not support the "
                     "task queue (TASK_QUEUE_ENABLE); forcing TASK_QUEUE_ENABLE=0."
                 )
-            import torch_npu
 
             abort_timeout = get_ascend_config().ft_communication_abort_timeout
             if abort_timeout > 0:
