@@ -30,6 +30,18 @@ CPU_DISTRIBUTED_TIMEOUT_S = 15
 FT_COMMUNICATION_ABORT_TIMEOUT_S = 10
 FAULT_DETECTION_DEADLINE_S = 45
 
+BENCHMARK_HOME = "./benchmark"
+_GSM8K_CASE = {
+    "case_type": "accuracy",
+    "dataset_path": "vllm-ascend/gsm8k-lite",
+    "request_conf": "vllm_api_general_chat",
+    "dataset_conf": "gsm8k/gsm8k_gen_0_shot_cot_chat_prompt",
+    "max_out_len": 1024,
+    "batch_size": 32,
+    "baseline": 95,
+    "threshold": 5,
+}
+
 
 # ---------------------------------------------------------------------------
 # Fault-injection via sitecustomize.py
@@ -280,6 +292,22 @@ def _assert_serving_and_healthy(
     _in_parallel(lambda s: _complete(s.get_client()), servers)
 
 
+def _run_gsm8k_eval(server: RemoteOpenAIServer, stage: str) -> float:
+
+    os.environ.setdefault("BENCHMARK_HOME", BENCHMARK_HOME)
+    from tools.aisbench import AisbenchRunner
+
+    with AisbenchRunner(
+        model=MODEL_NAME,
+        port=server.port,
+        aisbench_config=_GSM8K_CASE,
+        verify=True,
+    ) as aisbench:
+        accuracy = aisbench.result
+        print(f"[{stage}] GSM8K accuracy: {accuracy:.2f}")
+        return accuracy
+
+
 def _kill_worker_process(server: RemoteOpenAIServer) -> None:
     """SIGKILL only the worker proc, leaving EngineCore and API server alive."""
     workers = [p for p in psutil.Process(server.proc.pid).children(recursive=True) if "Worker" in " ".join(p.cmdline())]
@@ -389,6 +417,10 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
 
     All 4 being UNHEALTHY is the precondition for ``retry``.  The fault
     is patched via a generated ``sitecustomize.py``.
+
+    After recovery, the serving cluster must still meet the GSM8K accuracy
+    standard used by tests/e2e/weekly/single_node/models/test_qwen3_30b_acc.py
+    (baseline=95, threshold=5, i.e. accuracy >= 90%).
     """
     fault_step = int(os.getenv("FT_FAULT_STEP", "100"))
     _install_fault_injection(monkeypatch, tmp_path, rank=3, step=fault_step)
@@ -424,6 +456,16 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
 
         # 4. Recovery completes: all engines return to healthy and serve again.
         _assert_serving_and_healthy(all_ranks)
+
+        # 5. The recovered cluster must still meet the GSM8K accuracy
+        #    standard (>= 90%); AisbenchRunner raises otherwise. The injected
+        #    fault is a one-shot step guard, so this dataset run does not
+        #    re-trigger it.
+        recovered_acc = _run_gsm8k_eval(_server_for_rank(servers, 0), "post-retry")
+        print(
+            f"[GSM8K acc] recovered={recovered_acc:.2f}% "
+            f"(standard: >= {_GSM8K_CASE['baseline'] - _GSM8K_CASE['threshold']}%)"
+        )
 
 
 @pytest.mark.skipif(
