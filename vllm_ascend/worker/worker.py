@@ -382,6 +382,12 @@ class NPUWorker(WorkerBase):
                     "task queue (TASK_QUEUE_ENABLE); forcing TASK_QUEUE_ENABLE=0."
                 )
 
+            if parallel_config.tensor_parallel_size > 1:
+                # TP>1 relies on collective HCCL comms; disable HCCL's async
+                # error handling so it cannot abort the process out-of-band
+                # during fault-tolerance recovery.
+                os.environ["HCCL_ASYNC_ERROR_HANDLING"] = "0"
+
             abort_timeout = get_ascend_config().ft_communication_abort_timeout
             if abort_timeout > 0:
                 # User-provided HCCL timeouts win; otherwise derive them
@@ -396,7 +402,7 @@ class NPUWorker(WorkerBase):
                         "must be greater than HCCL_EXEC_TIMEOUT "
                         f"({os.environ['HCCL_EXEC_TIMEOUT']})"
                     )
-                torch_npu.npu.set_op_timeout_ms(abort_timeout * 1000)
+                torch.npu.set_op_timeout_ms(abort_timeout * 1000)
         if (
             parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
             and parallel_config.data_parallel_backend != "ray"
