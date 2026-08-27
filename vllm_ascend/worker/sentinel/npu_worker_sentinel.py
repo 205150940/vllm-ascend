@@ -11,6 +11,7 @@ from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
     WorkerSentinel as GPUWorkerSentinel,
 )
+
 from vllm_ascend.platform import NPUPlatform
 
 if TYPE_CHECKING:
