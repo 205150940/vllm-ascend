@@ -46,8 +46,7 @@ _GOLDEN_PROMPTS = [
     "What is the meaning of life?",
 ]
 _GOLDEN_OUTPUTS = [
-    " Sarah, and I am 14 years old. I have a question about the equation "
-    "$x^2 + y^2 = 1$. I know",
+    " Sarah, and I am 14 years old. I have a question about the equation $x^2 + y^2 = 1$. I know",
     " Paris. The capital of the United Kingdom is London. The capital of Germany is Berlin. "
     "The capital of Spain is Madrid. The capital of Italy is Rome.",
     " Is it possible to find a single, universal answer to this question, and how do "
