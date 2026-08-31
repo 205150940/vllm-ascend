@@ -911,30 +911,23 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            if vllm_config.parallel_config.enable_elastic_ep:
-                if upstream_eplb_config.use_async:
-                    raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
-                if upstream_eplb_config.communicator not in (None, "pynccl"):
-                    raise ValueError(
-                        "Elastic EP on Ascend requires the pynccl communicator "
-                        f"(PyHccl-backed), but got {upstream_eplb_config.communicator!r}."
-                    )
-                upstream_eplb_config.communicator = "pynccl"
-            else:
-                if upstream_eplb_config.communicator not in (None, "torch_gloo"):
-                    raise ValueError(
-                        "Async EPLB on Ascend requires the torch_gloo communicator "
-                        f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
-                        "Set eplb_config.communicator to 'torch_gloo'."
-                    )
-                if not upstream_eplb_config.use_async:
-                    logger.warning(
-                        "Synchronous EPLB is not supported on Ascend; "
-                        "parameter=eplb_config.use_async, value=False, "
-                        "action: forcing asynchronous EPLB."
-                    )
-                    upstream_eplb_config.use_async = True
-                    upstream_eplb_config.communicator = "torch_gloo"
+            # vLLM presets "pynccl" when elastic EP is enabled; Ascend uses
+            # the torch_gloo CPU-staging communicator for both regular and
+            # elastic EP, so normalize "pynccl" to "torch_gloo" here.
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl"):
+                raise ValueError(
+                    "Async EPLB on Ascend requires the torch_gloo communicator "
+                    f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
+                    "Set eplb_config.communicator to 'torch_gloo'."
+                )
+            if not upstream_eplb_config.use_async:
+                logger.warning(
+                    "Synchronous EPLB is not supported on Ascend; "
+                    "parameter=eplb_config.use_async, value=False, "
+                    "action: forcing asynchronous EPLB."
+                )
+                upstream_eplb_config.use_async = True
+            upstream_eplb_config.communicator = "torch_gloo"
     elif "load_collection_phase" in eplb_config:
         raise ValueError(
             "additional_config.eplb_config.load_collection_phase is only supported by "
