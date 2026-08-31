@@ -66,9 +66,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     @staticmethod
     def get_eplb_weight_views(layer) -> list[torch.Tensor]:
         weights = [layer.w13_weight, layer.w2_weight]
-        if getattr(layer, "w13_bias", None) is not None:
+        if layer.w13_bias is not None:
             weights.append(layer.w13_bias)
-        if getattr(layer, "w2_bias", None) is not None:
+        if layer.w2_bias is not None:
             weights.append(layer.w2_bias)
         return weights
 

@@ -654,6 +654,7 @@ class AscendConfig:
         )
 
         self._validate_mc2_comm_alg(vc)
+        self._validate_elastic_ep(vc)
 
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:
@@ -716,19 +717,20 @@ class AscendConfig:
                 "Please set additional_config.enable_fused_mc2 to 0."
             )
 
+    def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
-        if parallel_config.enable_elastic_ep:
-            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+        if not parallel_config.enable_elastic_ep:
+            return
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-            if get_ascend_device_type() != AscendDeviceType.A3:
-                raise ValueError("Elastic EP is only supported on A3.")
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("Elastic EP is only supported on A3.")
 
-            if self.eplb_config.dynamic_eplb:
-                raise RuntimeError(
-                    "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
-                    "Set dynamic_eplb=False in eplb_config to use Elastic EP."
-                    "Or use EPLB in ModelRunnerV2 instead."
-                )
+        if not getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError(
+                "Elastic EP is only supported with Model Runner V2. "
+                "Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
+            )
 
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
