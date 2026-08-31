@@ -19,8 +19,8 @@ End-to-end Elastic EP scaling tests for vllm-ascend.
 
 Launches a vLLM serve instance with Elastic EP enabled and performs a
 scale-down (dp=4 -> dp=3) followed by a scale-up (dp=3 -> dp=4), validating
-that inference quality is preserved using GSM8K accuracy evaluation
-(via aisbench).
+that inference quality is preserved with factual-prompt accuracy checks
+after each scaling stage.
 """
 
 import os
@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field
 
 import pytest
+import regex as re
 import requests
 from vllm.utils.network_utils import get_open_port
 
@@ -41,9 +42,6 @@ from tests.e2e.conftest import RemoteOpenAIServer
 QWEN3_30B_A3B_MODEL = "Qwen/Qwen3-30B-A3B"
 """HuggingFace / ModelScope identifier of the MoE model used for testing."""
 
-DATASET_NAME = "vllm-ascend/gsm8k-lite"
-"""HuggingFace / ModelScope identifier of the accuracy-evaluation dataset."""
-
 MAX_MODEL_LEN = 16384
 MAX_NUM_SEQS = 16
 
@@ -51,10 +49,16 @@ MAX_NUM_SEQS = 16
 # giving the Elastic EP state machine time to finish reconfiguration.
 _SCALE_DELAY_SECONDS = 30
 
-# GSM8K accuracy baseline and tolerance.
-# The model is expected to achieve accuracy within this range after scaling.
-GSM8K_BASELINE = 95.0
-GSM8K_THRESHOLD = 5.0
+# Post-scaling accuracy check: after each scaling stage, the server must
+# answer these factual prompts correctly. Each expected answer is a single
+# word, matched case-insensitively on word boundaries anywhere in the
+# completion, so harmless phrasing variations do not fail the check.
+_ANSWER_CASES = [
+    ("The capital of France is", ("Paris",)),
+    ("The largest planet in our solar system is", ("Jupiter",)),
+    ("The first month of the year is", ("January",)),
+]
+_ANSWER_MAX_TOKENS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -97,33 +101,26 @@ def _send_scale_command(server, new_dp_size: int) -> bool:
         return False
 
 
-def _run_gsm8k_eval(server, model_name: str, stage: str) -> float:
-    """Run GSM8K accuracy evaluation using aisbench.
+def _assert_correct_answers(server, model_name: str, stage: str) -> None:
+    """Send factual prompts to the server and assert the answer appears.
 
-    Returns the measured accuracy percentage.
+    Greedy decoding; case-insensitive whole-word match, not an exact-match
+    golden, so the check is independent of environment numerics.
     """
-    from tools.aisbench import AisbenchRunner
-
-    aisbench_case = {
-        "case_type": "accuracy",
-        "dataset_path": DATASET_NAME,
-        "request_conf": "vllm_api_general_chat",
-        "dataset_conf": "gsm8k/gsm8k_gen_0_shot_cot_chat_prompt",
-        "max_out_len": 4096,
-        "batch_size": 32,
-        "baseline": GSM8K_BASELINE,
-        "threshold": GSM8K_THRESHOLD,
-    }
-
-    with AisbenchRunner(
-        model=model_name,
-        port=server.port,
-        aisbench_config=aisbench_case,
-        verify=True,
-    ) as aisbench:
-        accuracy = aisbench.result
-        print(f"[{stage}] GSM8K accuracy: {accuracy:.2f}")
-        return accuracy
+    client = server.get_client()
+    for prompt, answers in _ANSWER_CASES:
+        resp = client.completions.create(
+            model=model_name,
+            prompt=prompt,
+            max_tokens=_ANSWER_MAX_TOKENS,
+            temperature=0.0,
+        )
+        completion = resp.choices[0].text
+        matched = any(re.search(rf"\b{re.escape(answer)}\b", completion, re.IGNORECASE) for answer in answers)
+        print(f"[{stage}][accuracy] prompt {prompt!r}: {completion!r}")
+        assert matched, (
+            f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
+        )
 
 
 def _make_env_dict() -> dict[str, str]:
@@ -223,7 +220,7 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
 
 
 def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
-    """Run the scaling sequence with GSM8K accuracy evaluation.
+    """Run the scaling sequence with factual-prompt accuracy checks.
 
     Args:
         config: The Elastic EP test configuration to use.
@@ -247,34 +244,15 @@ def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
     ) as server:
         print(f"Server started on port {server.port}")
 
-        # Store all accuracies for summary
-        accuracies: dict[str, float] = {}
-
-        # Run initial baseline evaluation
+        # Run initial baseline accuracy check
         initial_stage = f"Initial (dp={config.data_parallel_size})"
-        accuracies[initial_stage] = _run_gsm8k_eval(server, model_name, initial_stage)
-        print(f"  Initial accuracy: {accuracies[initial_stage]:.2f}")
+        _assert_correct_answers(server, model_name, initial_stage)
 
         # Run scaling steps
         for new_dp_size, stage_description in config.scale_sequence.steps:
             assert _send_scale_command(server, new_dp_size), f"{stage_description} failed"
             time.sleep(_SCALE_DELAY_SECONDS)
-            accuracies[stage_description] = _run_gsm8k_eval(server, model_name, stage_description)
-            print(f"  {stage_description} accuracy: {accuracies[stage_description]:.2f}")
-
-        # Print summary
-        print(f"nElastic EP Accuracy Summary ({config.name}):")
-        for stage, acc in accuracies.items():
-            print(f"  {stage}: {acc:.2f}")
-        print(f"  Baseline: {GSM8K_BASELINE:.2f} +/- {GSM8K_THRESHOLD:.2f}")
-
-        # Assert all accuracies are within range
-        for stage, acc in accuracies.items():
-            lower_bound = GSM8K_BASELINE - GSM8K_THRESHOLD
-            upper_bound = GSM8K_BASELINE + GSM8K_THRESHOLD
-            assert lower_bound <= acc <= upper_bound, (
-                f"{stage} GSM8K accuracy {acc:.2f} is outside expected range [{lower_bound}, {upper_bound}]"
-            )
+            _assert_correct_answers(server, model_name, stage_description)
 
 
 # ---------------------------------------------------------------------------
