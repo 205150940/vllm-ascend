@@ -24,10 +24,8 @@ from vllm.model_executor.layers.fused_moe import routed_experts as _routed_exper
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 
-from vllm_ascend.distributed.eplb.eplb_communicator import (
-    AscendGlooEplbCommunicator,
-    AscendHixlEplbCommunicator,
-)
+from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
+from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator
 from vllm_ascend.distributed.eplb.eplb_state import (
     ASYNC_EPLB_CYCLE_COMMITTED_LOG,
     EXPERT_MAPPING_EP_SIZE,
