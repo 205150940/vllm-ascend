@@ -37,7 +37,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_mc2_group,
 )
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
-from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
+from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 
 _PATCH_LOCK = threading.Lock()
 
