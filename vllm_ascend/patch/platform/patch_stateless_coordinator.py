@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 # Patch vllm.distributed.stateless_coordinator: use NPUCommunicator and
-# register HCCL stateless groups into torch's global ``_world``.
+# register HCCL/gloo stateless groups into torch's global ``_world``.
 
 import vllm.distributed.stateless_coordinator as _stateless_coordinator
 from torch.distributed import ProcessGroup, Store
@@ -26,7 +26,7 @@ _orig_stateless_init = _stateless_coordinator.stateless_init_torch_distributed_p
 _orig_stateless_destroy = _stateless_coordinator.stateless_destroy_torch_distributed_process_group
 
 
-# Register HCCL stateless groups into torch's ``_world`` on init so the
+# Register HCCL/gloo stateless groups into torch's ``_world`` on init so the
 # standard torch.distributed APIs can find them.
 def _ascend_stateless_init_pg(**kwargs) -> ProcessGroup | tuple[ProcessGroup, Store]:
     # Call the original helper first to create the stateless group.
@@ -35,10 +35,13 @@ def _ascend_stateless_init_pg(**kwargs) -> ProcessGroup | tuple[ProcessGroup, St
     else:
         pg = _orig_stateless_init(**kwargs)
 
-    # HCCL groups are not registered by the upstream helper; register them
-    # into torch's global ``_world`` state so torch.distributed APIs work.
-    if kwargs["backend"] == "hccl":
-        backend = "hccl"
+    # Stateless groups are not registered by the upstream helper; register
+    # them into torch's global ``_world`` state so torch.distributed APIs
+    # work. gloo registration is required for the async EPLB communicator
+    # (TorchDistGlooStagedEplbCommunicator) which issues batch_isend_irecv on
+    # the stateless cpu_group during elastic EP.
+    if kwargs["backend"] in ("hccl", "gloo"):
+        backend = kwargs["backend"]
         prefix_store = pg.get_group_store()
         group_name = pg.group_name
         backend_config = BackendConfig(backend)
