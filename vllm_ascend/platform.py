@@ -911,10 +911,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            # vLLM presets "pynccl" when elastic EP is enabled; Ascend uses
-            # the torch_gloo CPU-staging communicator for both regular and
-            # elastic EP, so normalize "pynccl" to "torch_gloo" here.
-            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl"):
+            # vLLM presets "pynccl" (or "nixl" when NIXL is detected) when
+            # elastic EP is enabled; Ascend uses the torch_gloo CPU-staging
+            # communicator for both regular and elastic EP, so normalize
+            # "pynccl"/"nixl" to "torch_gloo" here.
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl", "nixl"):
                 raise ValueError(
                     "Async EPLB on Ascend requires the torch_gloo communicator "
                     f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
