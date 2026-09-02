@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 import pytest
 import regex as re
 import requests
+import torch
 from vllm.utils.network_utils import get_open_port
 
 from tests.e2e.conftest import RemoteOpenAIServer
@@ -260,6 +261,20 @@ def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def has_npu_elastic_ep_capability() -> bool:
+    """Require at least 4 visible NPUs for dp=4 Elastic EP scaling tests."""
+    if not torch.npu.is_available():
+        return False
+    try:
+        return torch.npu.device_count() >= 4
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not has_npu_elastic_ep_capability(),
+    reason="Requires at least 4 NPUs for dp=4 Elastic EP scaling tests",
+)
 def test_elastic_ep_scaling_qwen3_30b() -> None:
     """Scale dp 4 -> 3 -> 4 (tp=1) with Default Graph."""
     _run_elastic_ep_test(CONFIG_QWEN3_30B_DEFAULT, QWEN3_30B_A3B_MODEL)

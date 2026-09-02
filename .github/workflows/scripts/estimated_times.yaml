@@ -187,6 +187,7 @@ estimated_times:
   tests/e2e/pull_request/four_card/test_sparse_hccl_checkpoint.py: 250
   # DSA-PCP MTP pool watch: A/B legs with 32K perf prompts.
   tests/e2e/pull_request/four_card/context_parallel/pool/test_deepseek_v4_pool.py: 1500
+  tests/e2e/pull_request/four_card/elastic_ep/test_elastic_ep.py: 1800
   tests/e2e/pull_request/two_card/test_gemma4.py: 290
   tests/e2e/pull_request/four_card/test_minimax_m3.py: 240
   tests/e2e/pull_request/four_card/test_kimi_k3.py: 600
