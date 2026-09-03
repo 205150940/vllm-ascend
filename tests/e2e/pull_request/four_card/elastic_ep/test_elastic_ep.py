@@ -133,9 +133,7 @@ def _traffic_loop(
     while not stop.is_set():
         request_start = time.perf_counter()
         try:
-            response = requests.post(
-                url, json=request_payload, headers=headers, timeout=120
-            )
+            response = requests.post(url, json=request_payload, headers=headers, timeout=120)
             status_code = response.status_code
         except requests.exceptions.RequestException:
             status_code = None
@@ -159,9 +157,7 @@ def _downtime(responses: list[tuple[float, float, int | None]]) -> float:
     rejected = [end for _, end, status in responses if status == 503]
     if not rejected:
         return 0
-    recovered = next(
-        end for _, end, status in responses if status == 200 and end > rejected[-1]
-    )
+    recovered = next(end for _, end, status in responses if status == 200 and end > rejected[-1])
     return recovered - rejected[0]
 
 
@@ -208,17 +204,12 @@ def _scale_with_traffic(
             assert _send_scale_command(server, new_dp_size)
             scale_seconds = time.perf_counter() - start_time
             finished.set()
-            probe_result, *results = [
-                future.result(timeout=120) for future in futures
-            ]
+            probe_result, *results = [future.result(timeout=120) for future in futures]
         finally:
             stop.set()
 
     bad_statuses = {
-        status
-        for responses in [probe_result, *results]
-        for _, _, status in responses
-        if status not in (200, 503)
+        status for responses in [probe_result, *results] for _, _, status in responses if status not in (200, 503)
     }
     assert not bad_statuses, f"traffic got unexpected statuses {bad_statuses}"
     probe_503 = [start for start, _, status in probe_result if status == 503]
@@ -254,9 +245,7 @@ def _assert_correct_answers(server, model_name: str, stage: str) -> None:
         completion = resp.choices[0].text
         matched = any(re.search(rf"\b{re.escape(answer)}\b", completion, re.IGNORECASE) for answer in answers)
         print(f"[{stage}][accuracy] prompt {prompt!r}: {completion!r}")
-        assert matched, (
-            f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
-        )
+        assert matched, f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
 
 
 def _make_env_dict() -> dict[str, str]:
@@ -397,14 +386,10 @@ def _run_elastic_ep_test(
         current_dp_size = config.data_parallel_size
         for new_dp_size, stage_description in config.scale_sequence.steps:
             if traffic_mode is None:
-                assert _send_scale_command(server, new_dp_size), (
-                    f"{stage_description} failed"
-                )
+                assert _send_scale_command(server, new_dp_size), f"{stage_description} failed"
                 time.sleep(_SCALE_DELAY_SECONDS)
             else:
-                _scale_with_traffic(
-                    server, current_dp_size, new_dp_size, model_name, traffic_mode
-                )
+                _scale_with_traffic(server, current_dp_size, new_dp_size, model_name, traffic_mode)
             current_dp_size = new_dp_size
             _assert_correct_answers(server, model_name, stage_description)
 
