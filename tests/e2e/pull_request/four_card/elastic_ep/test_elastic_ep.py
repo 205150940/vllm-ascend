@@ -21,11 +21,18 @@ Launches a vLLM serve instance with Elastic EP enabled and performs a
 scale-down (dp=4 -> dp=3) followed by a scale-up (dp=3 -> dp=4), validating
 that inference quality is preserved with factual-prompt accuracy checks
 after each scaling stage.
+
+Scaling can additionally run under continuous request traffic
+(``_scale_with_traffic``), which asserts that scaling only produces 200/503
+responses, that the commit is observed via the ``/is_scaling_elastic_ep``
+probe, and that requests keep completing during the preparation phase.
 """
 
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import pytest
@@ -102,6 +109,125 @@ def _send_scale_command(server, new_dp_size: int) -> bool:
         return False
 
 
+def _traffic_loop(
+    server: RemoteOpenAIServer,
+    dp_rank: int | None,
+    ready: threading.Barrier,
+    stop: threading.Event,
+    finished: threading.Event,
+    model_name: str,
+    is_probe: bool = False,
+) -> list[tuple[float, float, int | None]]:
+    """Send requests continuously until the scale finishes.
+
+    The probe (``is_probe=True``) polls ``/is_scaling_elastic_ep`` instead of
+    sending inference requests, so it can observe the exact 503 -> 200
+    transition caused by the scale commit.
+    """
+    url = server.url_for("is_scaling_elastic_ep" if is_probe else "v1/completions")
+    payload = {"model": model_name, "prompt": "Hello", "max_tokens": 4}
+    headers = None if dp_rank is None else {"X-data-parallel-rank": str(dp_rank)}
+    request_payload = None if is_probe else payload
+    responses = []
+    is_ready = False
+    while not stop.is_set():
+        request_start = time.perf_counter()
+        try:
+            response = requests.post(url, json=request_payload, headers=headers, timeout=120)
+            status_code = response.status_code
+        except requests.exceptions.RequestException:
+            status_code = None
+        responses.append((request_start, time.perf_counter(), status_code))
+        if status_code == 200:
+            if not is_ready:
+                ready.wait(timeout=120)
+                is_ready = True
+            if finished.is_set():
+                return responses
+        time.sleep(0.05)
+    return responses
+
+
+def _downtime(responses: list[tuple[float, float, int | None]]) -> float:
+    """Compute the downtime window from the probe's responses.
+
+    Downtime is the time between the first 503 (scale commit) and the first
+    200 after it (service recovered). Returns 0 if no 503 was observed.
+    """
+    rejected = [end for _, end, status in responses if status == 503]
+    if not rejected:
+        return 0
+    recovered = next(end for _, end, status in responses if status == 200 and end > rejected[-1])
+    return recovered - rejected[0]
+
+
+def _scale_with_traffic(
+    server: RemoteOpenAIServer,
+    source_dp_size: int,
+    new_dp_size: int,
+    model_name: str,
+    traffic_mode: str,
+) -> None:
+    """Scale the server while continuously sending requests.
+
+    Verifies that scaling under traffic only produces 200/503 statuses, that
+    the probe observes the commit (503), and that requests completed before
+    the scale. Prints the scale duration and the downtime window.
+    """
+    traffic_clients: list[int | None] = []
+    if traffic_mode == "light":
+        traffic_clients = [0]
+    elif traffic_mode == "heavy":
+        traffic_clients = [None] * source_dp_size
+    clients = [(None, True)] + [(rank, False) for rank in traffic_clients]
+    ready = threading.Barrier(len(clients) + 1)
+    stop = threading.Event()
+    finished = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=len(clients)) as executor:
+        futures = [
+            executor.submit(
+                _traffic_loop,
+                server,
+                rank,
+                ready,
+                stop,
+                finished,
+                model_name,
+                is_probe,
+            )
+            for rank, is_probe in clients
+        ]
+        try:
+            ready.wait(timeout=120)
+            start_time = time.perf_counter()
+            assert _send_scale_command(server, new_dp_size)
+            scale_seconds = time.perf_counter() - start_time
+            finished.set()
+            probe_result, *results = [future.result(timeout=120) for future in futures]
+        finally:
+            stop.set()
+
+    bad_statuses = {
+        status for responses in [probe_result, *results] for _, _, status in responses if status not in (200, 503)
+    }
+    assert not bad_statuses, f"traffic got unexpected statuses {bad_statuses}"
+    probe_503 = [start for start, _, status in probe_result if status == 503]
+    assert probe_503, "Scaling probe did not observe commit"
+    assert not results or any(
+        status == 200 and start_time <= request_start and request_end < probe_503[0]
+        for responses in results
+        for request_start, request_end, status in responses
+    ), "No request completed successfully during preparation"
+
+    print(
+        f"[Elastic EP timing][{source_dp_size}->{new_dp_size}]"
+        f"[traffic={traffic_mode}] "
+        f"scale_seconds={scale_seconds:.3f} "
+        f"downtime_seconds={_downtime(probe_result):.3f}"
+    )
+
+
 def _assert_correct_answers(server, model_name: str, stage: str) -> None:
     """Send factual prompts to the server and assert the answer appears.
 
@@ -119,9 +245,7 @@ def _assert_correct_answers(server, model_name: str, stage: str) -> None:
         completion = resp.choices[0].text
         matched = any(re.search(rf"\b{re.escape(answer)}\b", completion, re.IGNORECASE) for answer in answers)
         print(f"[{stage}][accuracy] prompt {prompt!r}: {completion!r}")
-        assert matched, (
-            f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
-        )
+        assert matched, f"[{stage}] answered {prompt!r} incorrectly: expected one of {answers!r}, got {completion!r}"
 
 
 def _make_env_dict() -> dict[str, str]:
@@ -220,12 +344,21 @@ def _build_vllm_args(config: ElasticEPTestConfig) -> list[str]:
     return args
 
 
-def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
+def _run_elastic_ep_test(
+    config: ElasticEPTestConfig,
+    model_name: str,
+    traffic_mode: str | None = None,
+) -> None:
     """Run the scaling sequence with factual-prompt accuracy checks.
 
     Args:
         config: The Elastic EP test configuration to use.
         model_name: Identifier of the model to serve.
+        traffic_mode: When set ("none"/"light"/"heavy"), each scaling step is
+            executed under continuous request traffic via
+            ``_scale_with_traffic`` (measuring scale duration / downtime).
+            When ``None``, each step uses the plain send-command-and-sleep
+            sequence.
     """
     vllm_serve_args = _build_vllm_args(config)
     env_dict = _make_env_dict()
@@ -250,9 +383,14 @@ def _run_elastic_ep_test(config: ElasticEPTestConfig, model_name: str) -> None:
         _assert_correct_answers(server, model_name, initial_stage)
 
         # Run scaling steps
+        current_dp_size = config.data_parallel_size
         for new_dp_size, stage_description in config.scale_sequence.steps:
-            assert _send_scale_command(server, new_dp_size), f"{stage_description} failed"
-            time.sleep(_SCALE_DELAY_SECONDS)
+            if traffic_mode is None:
+                assert _send_scale_command(server, new_dp_size), f"{stage_description} failed"
+                time.sleep(_SCALE_DELAY_SECONDS)
+            else:
+                _scale_with_traffic(server, current_dp_size, new_dp_size, model_name, traffic_mode)
+            current_dp_size = new_dp_size
             _assert_correct_answers(server, model_name, stage_description)
 
 
@@ -278,3 +416,25 @@ def has_npu_elastic_ep_capability() -> bool:
 def test_elastic_ep_scaling_qwen3_30b() -> None:
     """Scale dp 4 -> 3 -> 4 (tp=1) with Default Graph."""
     _run_elastic_ep_test(CONFIG_QWEN3_30B_DEFAULT, QWEN3_30B_A3B_MODEL)
+
+
+@pytest.mark.parametrize(
+    "traffic_mode",
+    [
+        pytest.param("none", id="none"),
+        pytest.param("light", id="light"),
+        pytest.param("heavy", id="heavy"),
+    ],
+)
+@pytest.mark.skipif(
+    not has_npu_elastic_ep_capability(),
+    reason="Requires at least 4 NPUs for dp=4 Elastic EP scaling tests",
+)
+def test_elastic_ep_scaling_qwen3_30b_with_traffic(traffic_mode: str) -> None:
+    """Scale dp 4 -> 3 -> 4 under continuous request traffic.
+
+    "none" runs the probe only (measures scale duration / downtime),
+    "light" adds a single traffic client, "heavy" one client per DP rank.
+    Factual-prompt accuracy is still checked after every scaling stage.
+    """
+    _run_elastic_ep_test(CONFIG_QWEN3_30B_DEFAULT, QWEN3_30B_A3B_MODEL, traffic_mode)
