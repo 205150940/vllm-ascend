@@ -147,9 +147,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         ):
             yield
 
-    def prepare_reconfiguration(
-        self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
-    ) -> None:
+    def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
         # Reuse the upstream implementation to build the world / dp / ep / eplb
         # standby groups and run the merged preparation steps (staged MoE quant
         # methods, EPLB communicator on the standby group, weight transfer for
