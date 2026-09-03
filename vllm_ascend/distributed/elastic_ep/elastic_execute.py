@@ -14,6 +14,7 @@ from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
@@ -146,10 +147,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         ):
             yield
 
-    def create_standby_groups(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
+    def prepare_reconfiguration(
+        self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
+    ) -> None:
         # Reuse the upstream implementation to build the world / dp / ep / eplb
-        # standby groups, then create the Ascend-specific MC2 standby group.
-        super().create_standby_groups(reconfig_request, use_all2all)
+        # standby groups and run the merged preparation steps (staged MoE quant
+        # methods, EPLB communicator on the standby group, weight transfer for
+        # scale-up, and target-group warmup), then create the Ascend-specific
+        # MC2 standby group.
+        super().prepare_reconfiguration(reconfig_request, use_all2all)
         create_ascend_standby_groups(
             new_dp_size=reconfig_request.new_data_parallel_size,
             new_world_size_across_dp=(
@@ -195,11 +201,19 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
 
     def switch_and_remove(self) -> None:
         super().switch_and_remove()
-        _replace_ascend_active_groups(mc2=None)
+        # The retired MC2 group is destroyed on the async executor like the
+        # upstream retired groups. The (collective) destroy must finish before
+        # this removing worker shuts down.
+        retired_ascend_groups = _replace_ascend_active_groups(mc2=None)
+        self._start_group_cleanup(retired_ascend_groups)
+        self._wait_for_group_cleanup()
 
-    def switch_and_prepare(self) -> None:
-        super().switch_and_prepare()
-        _replace_ascend_active_groups(**pop_ascend_standby_groups())
+    def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        retired_groups = super().switch_and_prepare()
+        # The Ascend MC2 group is retired alongside the upstream groups; it is
+        # appended here so the caller's background cleanup destroys it together
+        # with the upstream retired groups instead of blocking the commit.
+        retired_ascend_groups = _replace_ascend_active_groups(**pop_ascend_standby_groups())
         self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
         self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
         moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
@@ -209,15 +223,16 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             module.moe_config.ep_group = get_ep_group()
             module.moe_config.mc2_group = get_mc2_group()
         self._setup_moe_comm_and_quant_method()
+        return (*retired_groups, *retired_ascend_groups)
 
-    def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
-        mapping, num_logical_experts, num_valid_experts = super().receive_expert_mapping()
+    def receive_expert_mapping(self) -> torch.Tensor:
+        mapping = super().receive_expert_mapping()
         self._setup_moe_comm_and_quant_method()
-        return mapping, num_logical_experts, num_valid_experts
+        return mapping
 
-    def receive_weights(self) -> None:
+    def prepare_new_worker(self) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
-            super().receive_weights()
+            super().prepare_new_worker()
 
     def warmup_local_kernels(self) -> None:
         pass
