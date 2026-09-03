@@ -368,6 +368,11 @@ class NPUWorker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
+        # Finish any pending Elastic EP background group cleanup and stop the
+        # executor's async worker thread (mirrors upstream gpu_worker.py).
+        if elastic_ep_executor := getattr(self, "elastic_ep_executor", None):
+            elastic_ep_executor.shutdown()
+
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):

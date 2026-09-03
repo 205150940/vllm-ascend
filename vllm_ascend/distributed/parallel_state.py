@@ -175,12 +175,18 @@ def init_ascend_model_parallel(
 def _replace_ascend_active_groups(
     *,
     mc2: GroupCoordinator | None,
-) -> None:
-    """Replace the current MC2 group; all ranks must call this together."""
+) -> tuple[GroupCoordinator | None, ...]:
+    """Replace the active MC2 group and return the groups it replaced.
+
+    Mirrors upstream ``_replace_active_groups`` (vLLM #51885): the caller
+    owns destroying the retired group, so the destroy can run in the
+    background instead of blocking the elastic-EP commit. The retired group
+    must still be destroyed collectively by all ranks that share it.
+    """
     global _MC2
-    if _MC2 is not None:
-        _MC2.destroy()
+    retired_groups = (_MC2,)
     _MC2 = mc2
+    return retired_groups
 
 
 def model_parallel_initialized():
