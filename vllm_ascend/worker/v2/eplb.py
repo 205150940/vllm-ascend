@@ -110,11 +110,10 @@ class AscendEPLBController(EPLBController):
         model: nn.Module,
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
-        old_num_physical_experts: int | None = None,
     ) -> None:
         model = _unwrap_moe(model)
         assert is_mixture_of_experts(model)
-        from_mapping_kwargs: dict[str, Any] = dict(
+        self.state = AscendEplbState.from_mapping(
             model=model,
             model_config=model_config,
             device=self.device,
@@ -122,7 +121,4 @@ class AscendEPLBController(EPLBController):
             expanded_physical_to_logical=expanded_physical_to_logical,
             policy=self.eplb_policy,
         )
-        if old_num_physical_experts is not None:
-            from_mapping_kwargs["num_valid_physical_experts"] = old_num_physical_experts
-        self.state = AscendEplbState.from_mapping(**from_mapping_kwargs)
         self._has_registered_models = True
