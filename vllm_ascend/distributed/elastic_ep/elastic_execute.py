@@ -14,6 +14,7 @@ from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
+from vllm.distributed.elastic_ep.standby_state import create_standby_groups, get_standby_eplb_group
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
@@ -148,19 +149,48 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             yield
 
     def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
-        # Reuse the upstream implementation to build the world / dp / ep / eplb
-        # standby groups and run the eager-mode preparation steps (staging,
-        # EPLB communicator creation, weight transfer, group warm-up), then
-        # create the Ascend-specific MC2 standby group.
-        super().prepare_reconfiguration(reconfig_request, use_all2all)
+        # Ascend-specific variant of the upstream preparation. It mirrors
+        # ElasticEPScalingExecutor.prepare_reconfiguration step by step, with
+        # the Ascend MC2 standby group created after the upstream
+        # world/dp/ep/eplb groups and before transfer_weights (upstream runs
+        # the warm-up at that point instead; see _warm_target_groups for why
+        # it is skipped on Ascend).
+        #
+        # The placement is load-bearing: every stateless-group rendezvous
+        # completes only when ALL members have joined, so both sides must
+        # create the groups in the SAME relative order. The new worker's
+        # boot creates its initial groups as world -> dp -> ep -> eplb -> mc2
+        # (ensure_model_parallel_initialized, then init_ascend_model_parallel)
+        # and only reaches prepare_new_worker after that. Creating the MC2
+        # standby group before the upstream groups, or after the weight
+        # transfer, deadlocks the scale-up:
+        #   existing @ mc2/world rendezvous  <->  new worker @ world/mc2,
+        # or existing @ transfer_weights  <->  new worker @ mc2 rendezvous.
+        self._wait_for_group_cleanup()
+        self.reconfig_request = reconfig_request
+        new_dp_size = reconfig_request.new_data_parallel_size
+        old_dp_size = get_dp_group().world_size
+        parallel_config = self.worker.vllm_config.parallel_config
+        world_size = parallel_config.world_size
+        new_world_size_across_dp = world_size * new_dp_size
+        create_standby_groups(
+            new_dp_size=new_dp_size,
+            new_world_size_across_dp=new_world_size_across_dp,
+            master_ip=reconfig_request.new_data_parallel_master_ip,
+            coord_store_port=reconfig_request.coord_store_port,
+            use_all2all=use_all2all,
+            enable_eplb=parallel_config.enable_eplb,
+        )
         create_ascend_standby_groups(
-            new_dp_size=reconfig_request.new_data_parallel_size,
-            new_world_size_across_dp=(
-                self.worker.vllm_config.parallel_config.world_size * reconfig_request.new_data_parallel_size
-            ),
+            new_dp_size=new_dp_size,
+            new_world_size_across_dp=new_world_size_across_dp,
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
         )
+        self.stage_standby_moe_quant_methods()
+        self._prepare_eplb_communicator(get_standby_eplb_group())
+        if new_dp_size > old_dp_size:
+            self.transfer_weights(old_dp_size, new_dp_size)
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         with _PATCH_LOCK, self._use_ascend_transfer_impl():
@@ -230,23 +260,9 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             super().prepare_new_worker()
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
-        # torch_npu's ProcessGroupHCCL binds each communicator to the INPUT
-        # TENSOR's device (getDeviceList -> OptionalNPUGuard ->
-        # hcclCommInitRootInfoConfig); Options._device and the thread's
-        # current device are ignored. StatelessGroupCoordinator.device comes
-        # from the world group's device_index, which is 0 in every Ray actor
-        # process, so a tensor allocated there makes all ranks bind the same
-        # physical NPU (HCCL EI0015 ranktable error). Warm from this worker's
-        # own (dp-shifted) device instead.
-        assert dp_group is not None and ep_group is not None
-        device = self.worker.device
-        current_platform.set_device(device)
-        stream = torch.Stream(device=device)
-        with stream:
-            tensor = torch.zeros(1, dtype=torch.int32, device=device)
-            for group in (dp_group, ep_group):
-                torch.distributed.all_reduce(tensor, group=group.device_group)
-                stream.synchronize()
+        # No-op on Ascend: the dp/ep device_group carries no HCCL traffic
+        # (DP sync on cpu_group, MoE on MC2, EPLB on gloo), so skip the warm.
+        return
 
     def warmup_local_kernels(self) -> None:
         pass
