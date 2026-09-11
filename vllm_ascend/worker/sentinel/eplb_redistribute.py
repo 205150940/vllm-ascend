@@ -297,7 +297,7 @@ def reload_experts_from_disk(
     # Produce every expert, not just the ones local at startup. Only the
     # default loader carries this EPLB filter attribute.
     if hasattr(loader, "local_expert_ids"):
-        loader.local_expert_ids = None
+        loader.local_expert_ids = {logical_id for _, logical_id in local_slots}
     all_weights = loader.get_all_weights(vllm_config.model_config, model)
 
     wanted_suffixes = set(_W13_WEIGHT_SUFFIXES + _W13_SCALE_SUFFIXES)
