@@ -98,4 +98,3 @@ import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
 #    Future Plan:
 #       Remove this patch when upstream supports per-group or backend-defined
 #       prefill boundaries.
-
