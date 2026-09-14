@@ -672,6 +672,28 @@ class NPUPlatform(Platform):
 
         return pg
 
+    @classmethod
+    def on_stateless_process_group_created(cls, pg: ProcessGroup, backend: str) -> None:
+        """Register stateless HCCL/gloo groups into torch's global ``_world``.
+
+        Stateless process groups are not registered by the upstream helper,
+        so ``torch.distributed`` module-level APIs (global-rank translation
+        in broadcast/send/recv, ``get_global_rank``) cannot resolve them.
+        Elastic EP relies on this for the stateless world/dp/ep groups and
+        the EPLB gloo staging group.
+        """
+        if backend not in ("hccl", "gloo"):
+            return
+        from vllm_ascend.distributed.stateless_coordinator import _register_pg
+
+        _register_pg(pg, backend)
+
+    @classmethod
+    def on_stateless_process_group_destroyed(cls, pg: ProcessGroup) -> None:
+        from vllm_ascend.distributed.stateless_coordinator import _unregister_pg
+
+        _unregister_pg(pg)
+
 
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
     """
