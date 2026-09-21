@@ -10,13 +10,14 @@ translation on the stateless world/dp/ep groups and by the async EPLB
 communicator issuing ``batch_isend_irecv`` on the stateless gloo group
 during elastic EP.
 
-Two wiring paths exist for the same registration:
-- ``NPUPlatform.on_stateless_process_group_created`` /
-  ``on_stateless_process_group_destroyed`` platform lifecycle hooks
-  (preferred when the supported vLLM revision provides them), and
-- ``AscendStatelessGroupCoordinator`` (below), a subclass swapped in by
-  ``vllm_ascend/patch/platform/patch_stateless_coordinator.py`` for
-  revisions without the hooks.
+Registration is done at the vLLM Ascend-owned call sites right after
+the coordinators are created:
+- ``NPUWorker._init_worker_distributed_environment`` for the startup
+  world/dp/ep/eplb groups, and
+- ``AscendElasticEPScalingExecutor.prepare_reconfiguration`` for the
+  standby groups created on scale-up preparation.
+Unregistration is paired in
+``AscendElasticEPScalingExecutor._destroy_retired_groups``.
 """
 
 from torch.distributed import ProcessGroup
@@ -48,27 +49,25 @@ def _unregister_pg(pg: ProcessGroup) -> None:
     _world.pg_backend_config.pop(pg, None)
 
 
-class AscendStatelessGroupCoordinator(StatelessGroupCoordinator):
-    """Stateless group coordinator whose torch PGs are registered in
-    torch's global ``_world`` (see module docstring for why).
+def register_stateless_coordinator_pgs(
+    coordinator: StatelessGroupCoordinator,
+) -> None:
+    """Register a stateless coordinator's torch PGs into ``_world``.
 
-    The device (HCCL) and CPU (gloo) groups are registered right after
-    they are created, and unregistered when the coordinator is
-    destroyed, mirroring the lifecycle of the platform hooks.
+    Call right after the coordinator is created; pair with
+    ``unregister_stateless_coordinator_pgs`` when it is destroyed.
     """
+    if coordinator.device_group is not None:
+        _register_pg(coordinator.device_group, coordinator.backend)
+    if coordinator.cpu_group is not None:
+        _register_pg(coordinator.cpu_group, "gloo")
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        if self.device_group is not None:
-            _register_pg(self.device_group, self.backend)
-        if self.cpu_group is not None:
-            _register_pg(self.cpu_group, "gloo")
 
-    def destroy(self) -> None:
-        try:
-            super().destroy()
-        finally:
-            if self.device_group is not None:
-                _unregister_pg(self.device_group)
-            if self.cpu_group is not None:
-                _unregister_pg(self.cpu_group)
+def unregister_stateless_coordinator_pgs(
+    coordinator: StatelessGroupCoordinator,
+) -> None:
+    """Mirror ``register_stateless_coordinator_pgs`` on destruction."""
+    if coordinator.device_group is not None:
+        _unregister_pg(coordinator.device_group)
+    if coordinator.cpu_group is not None:
+        _unregister_pg(coordinator.cpu_group)

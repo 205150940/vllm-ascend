@@ -627,32 +627,6 @@
 #       before DSpark draft selection, or otherwise guarantees that rebuilding
 #       `model_arch_config` preserves the selected draft architecture.
 #
-# ** File: platform/patch_stateless_coordinator.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.distributed.stateless_coordinator.StatelessGroupCoordinator`
-#    Why:
-#       Upstream creates stateless torch process groups (device + gloo CPU)
-#       without registering them in torch's global ``_world``, so
-#       ``torch.distributed`` module-level APIs (broadcast/send/recv
-#       global-rank translation, ``get_global_rank``, ``batch_isend_irecv``)
-#       cannot resolve them. Elastic EP on Ascend needs this: the async EPLB
-#       gloo staging communicator issues ``batch_isend_irecv`` on the
-#       stateless gloo group during expert reshuffle.
-#    How:
-#       Swap ``StatelessGroupCoordinator`` for
-#       ``AscendStatelessGroupCoordinator`` (in
-#       ``vllm_ascend/distributed/stateless_coordinator.py``), which
-#       registers its device (HCCL) and CPU (gloo) groups into ``_world``
-#       after creation and unregisters them on destroy.
-#    Related PR (if no, explain why):
-#       No, Ascend-specific ``_world`` registration. Newer vLLM revisions
-#       provide the ``NPUPlatform.on_stateless_process_group_created`` /
-#       ``on_stateless_process_group_destroyed`` hooks as the preferred
-#       wiring path.
-#    Future Plan:
-#       Remove this patch once all supported vLLM revisions ship the
-#       stateless-PG platform lifecycle hooks.
-#
 # ** 19. File: platform/patch_structured_output.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`

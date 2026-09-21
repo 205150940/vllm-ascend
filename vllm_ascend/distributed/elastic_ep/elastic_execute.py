@@ -11,7 +11,10 @@ from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
-from vllm.distributed.elastic_ep.standby_state import create_standby_groups, get_standby_eplb_group
+from vllm.distributed.elastic_ep.standby_state import (
+    create_standby_groups,
+    get_standby_eplb_group,
+)
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
@@ -34,6 +37,10 @@ from vllm_ascend.distributed.parallel_state import (
     GroupCoordinator,
     _replace_ascend_active_groups,
     get_mc2_group,
+)
+from vllm_ascend.distributed.stateless_coordinator import (
+    register_stateless_coordinator_pgs,
+    unregister_stateless_coordinator_pgs,
 )
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
@@ -170,6 +177,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
         )
+        # The standby EPLB group is the only stateless group whose torch
+        # PGs are consumed through torch.distributed module-level APIs
+        # (the gloo staged EPLB communicator and the dynamic-EPLB P2P
+        # transfer pass global ranks). Register it so those calls can
+        # resolve the group. Paired with unregistration in
+        # _destroy_retired_groups.
+        standby_eplb_group = get_standby_eplb_group()
+        if standby_eplb_group is not None:
+            register_stateless_coordinator_pgs(standby_eplb_group)
         create_ascend_standby_groups(
             new_dp_size=new_dp_size,
             new_world_size_across_dp=new_world_size_across_dp,
@@ -210,6 +226,19 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         gc.collect()
         torch.npu.synchronize()
         torch.npu.empty_cache()
+
+    def _destroy_retired_groups(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
+        # Pair of the ``_register_pg`` call in prepare_reconfiguration:
+        # drop the retired stateless groups from torch's ``_world`` before
+        # their PGs are shut down, so stale entries don't keep the PG
+        # objects (and their HCCL/gloo comms) alive across scaling rounds.
+        # Unregistration must never skip the actual destroy.
+        try:
+            for group in groups:
+                if isinstance(group, StatelessGroupCoordinator):
+                    unregister_stateless_coordinator_pgs(group)
+        finally:
+            super()._destroy_retired_groups(groups)
 
     def switch_and_remove(self) -> None:
         super().switch_and_remove()
