@@ -13,6 +13,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
+    get_standby_dp_group,
     get_standby_eplb_group,
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
@@ -61,88 +62,166 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
     setup_moe_comm_method(module.moe_config)
 
 
-class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
-    def _batch_transfer_weights(
-        self,
-        model: nn.Module,
-        is_sender: bool,
-        peer_rank: int,
-        dp_group: StatelessGroupCoordinator,
-        expert_weights: Sequence[Iterable[torch.Tensor]],
-    ) -> None:
-        # Ascend HCCL P2P weight transfer, overriding the upstream
-        # implementation. Differs from upstream: collects params from
-        # __dict__/AttentionImplBase, negotiates param names via TCP store,
-        # skips contiguous() (HCCL native support).
-        device_comm = dp_group.device_communicator
-        tcp_store_group = dp_group.tcp_store_group
-        if device_comm is None:
-            raise ValueError("No device communicator found")
+def batch_transfer_weights(
+    model: nn.Module,
+    is_sender: bool,
+    peer_rank: int,
+    dp_group: StatelessGroupCoordinator,
+    expert_weights: Sequence[Iterable[torch.Tensor]],
+) -> None:
+    # Ascend HCCL P2P weight transfer. Differs from upstream: collects
+    # params from __dict__/AttentionImplBase, negotiates param names via
+    # TCP store, skips contiguous() (HCCL native support).
+    device_comm = dp_group.device_communicator
+    tcp_store_group = dp_group.tcp_store_group
+    if device_comm is None:
+        raise ValueError("No device communicator found")
 
-        expert_weights_set = set()
-        for weight_group in expert_weights:
-            for weight in weight_group:
-                if isinstance(weight, torch.Tensor):
-                    expert_weights_set.add(weight.data_ptr())
-                else:
-                    expert_weights_set.update(w.data_ptr() for w in weight)
-
-        state_dict = model.state_dict()
-        all_params = []
-        all_params_ptrs = set()
-        all_params_name = []
-
-        for name, param in state_dict.items():
-            if name.endswith("expert_map"):
-                continue
-            ptr = param.data_ptr()
-            if ptr not in all_params_ptrs and ptr not in expert_weights_set:
-                if param.device.type == "npu":
-                    all_params.append(param.data)
-                    all_params_ptrs.add(ptr)
-                    all_params_name.append(name)
-
-        def handle_sub_module(submodule, submodule_name):
-            for attr_name, attr_value in submodule.__dict__.items():
-                if isinstance(attr_value, torch.Tensor):
-                    data_ptr = attr_value.data_ptr()
-                    if data_ptr not in all_params_ptrs and data_ptr not in expert_weights_set:
-                        if attr_value.device.type == "npu":
-                            all_params.append(attr_value)
-                            all_params_ptrs.add(data_ptr)
-                            all_params_name.append(submodule_name + "." + attr_name)
-                if isinstance(attr_value, AttentionImplBase):
-                    handle_sub_module(attr_value, submodule_name + "." + attr_name)
-
-        for module_name, module in model.named_modules():
-            handle_sub_module(module, module_name)
-
-        if is_sender:
-            tcp_store_group.send_obj(all_params_name, dst=peer_rank)
-            peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
-        else:
-            peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
-            tcp_store_group.send_obj(all_params_name, dst=peer_rank)
-
-        if len(all_params_name) != len(peer_rank_all_params_name):
-            common = list(set(all_params_name) & set(peer_rank_all_params_name))
-            ids = [all_params_name.index(name) for name in common]
-            all_params = [param for idx, param in enumerate(all_params) if idx in ids]
-
-        assert len(all_params) > 0
-        p2p_ops = []
-        for param in all_params:
-            op = object.__new__(P2POp)
-            if is_sender:
-                op.op = torch.distributed.isend
-                op.tensor = param
+    expert_weights_set = set()
+    for weight_group in expert_weights:
+        for weight in weight_group:
+            if isinstance(weight, torch.Tensor):
+                expert_weights_set.add(weight.data_ptr())
             else:
-                op.op = torch.distributed.irecv
-                op.tensor = param
-            op.group_peer = peer_rank
-            p2p_ops.append(op)
+                expert_weights_set.update(w.data_ptr() for w in weight)
 
-        device_comm.batch_isend_irecv(p2p_ops)
+    state_dict = model.state_dict()
+    all_params = []
+    all_params_ptrs = set()
+    all_params_name = []
+
+    for name, param in state_dict.items():
+        if name.endswith("expert_map"):
+            continue
+        ptr = param.data_ptr()
+        if ptr not in all_params_ptrs and ptr not in expert_weights_set:
+            if param.device.type == "npu":
+                all_params.append(param.data)
+                all_params_ptrs.add(ptr)
+                all_params_name.append(name)
+
+    def handle_sub_module(submodule, submodule_name):
+        for attr_name, attr_value in submodule.__dict__.items():
+            if isinstance(attr_value, torch.Tensor):
+                data_ptr = attr_value.data_ptr()
+                if data_ptr not in all_params_ptrs and data_ptr not in expert_weights_set:
+                    if attr_value.device.type == "npu":
+                        all_params.append(attr_value)
+                        all_params_ptrs.add(data_ptr)
+                        all_params_name.append(submodule_name + "." + attr_name)
+            if isinstance(attr_value, AttentionImplBase):
+                handle_sub_module(attr_value, submodule_name + "." + attr_name)
+
+    for module_name, module in model.named_modules():
+        handle_sub_module(module, module_name)
+
+    if is_sender:
+        tcp_store_group.send_obj(all_params_name, dst=peer_rank)
+        peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
+    else:
+        peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
+        tcp_store_group.send_obj(all_params_name, dst=peer_rank)
+
+    if len(all_params_name) != len(peer_rank_all_params_name):
+        common = list(set(all_params_name) & set(peer_rank_all_params_name))
+        ids = [all_params_name.index(name) for name in common]
+        all_params = [param for idx, param in enumerate(all_params) if idx in ids]
+
+    assert len(all_params) > 0
+    p2p_ops = []
+    for param in all_params:
+        op = object.__new__(P2POp)
+        if is_sender:
+            op.op = torch.distributed.isend
+            op.tensor = param
+        else:
+            op.op = torch.distributed.irecv
+            op.tensor = param
+        op.group_peer = peer_rank
+        p2p_ops.append(op)
+
+    device_comm.batch_isend_irecv(p2p_ops)
+
+
+class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
+    def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
+        # Mirror of the upstream transfer_weights: same sender/receiver
+        # pairing, routing the per-peer transfer to the module-level
+        # batch_transfer_weights above.
+        standby_dp_group = get_standby_dp_group()
+        assert standby_dp_group is not None
+        # Broadcast old_dp_size to all workers in standby group
+        if standby_dp_group.rank_in_group < old_dp_size:
+            old_dp_size_tensor = torch.tensor([old_dp_size], dtype=torch.int64, device="cpu")
+        else:
+            old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
+        old_dp_size_tensor = standby_dp_group.tcp_store_group.broadcast(old_dp_size_tensor, 0)
+
+        num_new_workers = new_dp_size - old_dp_size
+        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+
+        # Sender-receiver pairing: the first new_workers % old_dp_size
+        # senders get (k+1) contiguous receivers, the rest get k
+        # receivers.
+        num_dst_per_sender = num_new_workers // old_dp_size
+        remainder = num_new_workers % old_dp_size
+
+        if dp_rank < remainder:
+            recv_begin = dp_rank * (num_dst_per_sender + 1)
+            recv_end = recv_begin + num_dst_per_sender + 1
+        else:
+            recv_begin = remainder * (num_dst_per_sender + 1) + (dp_rank - remainder) * num_dst_per_sender
+            recv_end = recv_begin + num_dst_per_sender
+
+        ranks_to_send = list(range(old_dp_size + recv_begin, old_dp_size + recv_end))
+
+        model = self.worker.model_runner.get_model()
+        for new_worker_rank in sorted(ranks_to_send):
+            batch_transfer_weights(
+                model=model,
+                is_sender=True,
+                peer_rank=new_worker_rank,
+                dp_group=standby_dp_group,
+                expert_weights=model.expert_weights,
+            )
+        torch.accelerator.synchronize()
+
+    def prepare_new_worker(self) -> None:
+        # Mirror of the upstream prepare_new_worker: same sender
+        # computation, routing the transfer to the module-level
+        # batch_transfer_weights above.
+        dp_group = get_dp_group()
+        assert isinstance(dp_group, StatelessGroupCoordinator)
+        new_dp_size = dp_group.world_size
+        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+
+        # Receive old_dp_size broadcasted during transfer_weights
+        old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
+        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(old_dp_size_tensor, 0)
+        old_dp_size = int(old_dp_size_tensor[0].item())
+
+        # Calculate which existing worker will send to this new worker
+        num_new_workers = new_dp_size - old_dp_size
+        new_worker_idx = dp_rank - old_dp_size
+        num_dst_per_sender = num_new_workers // old_dp_size
+        remainder = num_new_workers % old_dp_size
+
+        if new_worker_idx < remainder * (num_dst_per_sender + 1):
+            sender_rank = new_worker_idx // (num_dst_per_sender + 1)
+        else:
+            sender_rank = remainder + (new_worker_idx - remainder * (num_dst_per_sender + 1)) // num_dst_per_sender
+
+        model = self.worker.model_runner.get_model()
+        expert_weights = [module.get_expert_weights() for module in model.modules() if is_moe_layer(module)]
+        batch_transfer_weights(
+            model=model,
+            is_sender=False,
+            peer_rank=sender_rank,
+            dp_group=dp_group,
+            expert_weights=expert_weights,
+        )
+        torch.accelerator.synchronize()
+        self._warm_target_groups(get_dp_group(), get_ep_group())
 
     def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
         # Ascend-specific variant of the upstream preparation. It mirrors
