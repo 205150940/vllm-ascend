@@ -1019,6 +1019,12 @@ class AscendConfig:
                 "Elastic EP is only supported with Model Runner V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
             )
 
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "Elastic EP is not supported with prefill context parallelism "
+                f"(prefill_context_parallel_size={parallel_config.prefill_context_parallel_size})."
+            )
+
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
             raise NotImplementedError(

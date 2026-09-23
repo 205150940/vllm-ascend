@@ -1,21 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
-"""Register stateless process groups in torch's global ``_world``.
+"""Register the stateless EPLB group in torch's global ``_world``.
 
 Upstream ``stateless_init_torch_distributed_process_group`` creates
-process groups that are not registered in torch's global ``_world``
-state, so ``torch.distributed`` module-level APIs cannot find them.
-This is required by e.g. ``broadcast``/``send``/``recv`` global-rank
-translation on the stateless world/dp/ep groups and by the async EPLB
-communicator issuing ``batch_isend_irecv`` on the stateless gloo group
-during elastic EP.
+process groups that are deliberately not registered in torch's global
+``_world`` state, so ``torch.distributed`` module-level APIs cannot
+resolve them. Ascend needs this for the stateless EPLB group's CPU
+(gloo) process group, which is consumed by the gloo staged EPLB
+communicator (``dist.get_global_rank`` + ``batch_isend_irecv``) and by
+the dynamic-EPLB P2P transfer (global ranks) during elastic EP.
 
-Registration is done at the vLLM Ascend-owned call sites right after
-the coordinators are created:
+Only the CPU (gloo) group is registered. The world/dp/ep groups talk
+through coordinator methods (PyHccl / TCP store) and never consult
+``_world``, and the EPLB device group is only used through
+``ProcessGroup`` methods, so registering them would only widen the
+blast radius.
+
+Ordering constraint: ``DeviceCommunicatorBase.__init__`` treats a
+``cpu_group`` as stateless iff it is absent from ``_world.pg_map``.
+Registration must therefore happen *after* the coordinator (and its
+device communicator) has been constructed, or the communicator would be
+misclassified as stateful and take the ``dist.get_rank(group=...)``
+path. Call sites:
 - ``NPUWorker._init_worker_distributed_environment`` for the startup
-  world/dp/ep/eplb groups, and
+  EPLB group, and
 - ``AscendElasticEPScalingExecutor.prepare_reconfiguration`` for the
-  standby groups created on scale-up preparation.
+  standby EPLB group created on scale-up preparation.
 Unregistration is paired in
 ``AscendElasticEPScalingExecutor._destroy_retired_groups``.
 """
@@ -36,10 +46,6 @@ def _register_pg(pg: ProcessGroup, backend: str) -> None:
     _world.pg_names[pg] = pg.group_name
     _world.pg_backend_config[pg] = str(BackendConfig(backend))
 
-    # The WORLD group is used as torch's default process group.
-    if "WORLD" in (pg.group_name or ""):
-        _world.default_pg = pg
-
 
 def _unregister_pg(pg: ProcessGroup) -> None:
     """Mirror ``_register_pg``: drop the group from ``_world``."""
@@ -52,13 +58,11 @@ def _unregister_pg(pg: ProcessGroup) -> None:
 def register_stateless_coordinator_pgs(
     coordinator: StatelessGroupCoordinator,
 ) -> None:
-    """Register a stateless coordinator's torch PGs into ``_world``.
+    """Register a stateless coordinator's CPU (gloo) group into ``_world``.
 
     Call right after the coordinator is created; pair with
     ``unregister_stateless_coordinator_pgs`` when it is destroyed.
     """
-    if coordinator.device_group is not None:
-        _register_pg(coordinator.device_group, coordinator.backend)
     if coordinator.cpu_group is not None:
         _register_pg(coordinator.cpu_group, "gloo")
 
@@ -67,7 +71,5 @@ def unregister_stateless_coordinator_pgs(
     coordinator: StatelessGroupCoordinator,
 ) -> None:
     """Mirror ``register_stateless_coordinator_pgs`` on destruction."""
-    if coordinator.device_group is not None:
-        _unregister_pg(coordinator.device_group)
     if coordinator.cpu_group is not None:
         _unregister_pg(coordinator.cpu_group)
