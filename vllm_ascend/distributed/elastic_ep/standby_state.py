@@ -32,12 +32,12 @@ def create_ascend_standby_groups(
 
     all_ranks = torch.arange(new_world_size_across_dp).reshape(-1, new_dp_size * pp_size * tp_size)
     group_ranks = all_ranks.unbind(0)
-    standby_ep_ranks = [x.tolist() for x in group_ranks]
+    standby_mc2_ranks = [x.tolist() for x in group_ranks]
 
     # The standby MC2 group is always stateless: it is only built for elastic
     # EP scaling, so new ranks must be able to join the topology dynamically.
     _STANDBY_MC2 = _init_stateless_group(
-        standby_ep_ranks,
+        standby_mc2_ranks,
         "mc2",
         master_ip,
         backend,

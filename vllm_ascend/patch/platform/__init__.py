@@ -56,6 +56,7 @@ import vllm_ascend.patch.platform.patch_engram_config  # noqa
 import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
 import vllm_ascend.patch.platform.patch_indexer_kv_dtype  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_dtype  # noqa
+
 # ** File: platform/patch_kv_cache_utils.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_utils`
@@ -106,4 +107,3 @@ import vllm_ascend.patch.platform.patch_kv_cache_dtype  # noqa
 #    Future Plan:
 #       Remove this patch when upstream supports per-group or backend-defined
 #       prefill boundaries.
-
