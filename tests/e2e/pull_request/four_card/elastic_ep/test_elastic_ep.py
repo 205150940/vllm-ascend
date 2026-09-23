@@ -75,14 +75,15 @@ _ANSWER_MAX_TOKENS = 16
 
 
 @pytest.fixture(autouse=True)
-def cleanup_ray_between_tests():
+def cleanup_ray_between_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force-stop any lingering Ray processes between tests."""
     subprocess.run(["ray", "stop", "--force"], timeout=30, capture_output=True)
     time.sleep(5)
 
-    env_dict = _make_env_dict()
-    for key, value in env_dict.items():
-        os.environ[key] = value
+    # monkeypatch.setenv so the vars are visible to `ray start --head` (Ray
+    # workers inherit the daemon env) and are restored after the test.
+    for key, value in _make_env_dict().items():
+        monkeypatch.setenv(key, value)
 
     subprocess.run(["ray", "start", "--head"], timeout=30, capture_output=True)
     time.sleep(5)

@@ -1473,7 +1473,7 @@
 #       Remove this patch once upstream `IndexerKVDType` includes `"int8"` (or once
 #       the indexer kv dtype is pluggable like the fp8 kv-cache-dtype mechanism).
 #
-# ** 39. File: platform/patch_parallel_config.py**
+# ** 36. File: platform/patch_parallel_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.parallel.ParallelConfig._validate_parallel_config`
 #    Why:
