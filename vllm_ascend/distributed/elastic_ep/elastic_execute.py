@@ -71,9 +71,11 @@ def batch_transfer_weights(
     dp_group: StatelessGroupCoordinator,
     expert_weights: Sequence[Iterable[torch.Tensor]],
 ) -> None:
-    # Ascend HCCL P2P weight transfer. Differs from upstream: collects
-    # params from __dict__/AttentionImplBase, negotiates param names via
-    # TCP store, skips contiguous() (HCCL native support).
+    # Ascend HCCL P2P weight transfer. Differs from upstream: collects params
+    # from __dict__/AttentionImplBase and negotiates param names via the TCP
+    # store. HCCL, like PyNccl, transfers flat memory (data_ptr + numel) and
+    # does not honor tensor strides, so non-contiguous params are materialized
+    # into a contiguous copy and copied back on the receive side.
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -124,25 +126,34 @@ def batch_transfer_weights(
         peer_rank_all_params_name = tcp_store_group.recv_obj(src=peer_rank)
         tcp_store_group.send_obj(all_params_name, dst=peer_rank)
 
-    if len(all_params_name) != len(peer_rank_all_params_name):
-        common = list(set(all_params_name) & set(peer_rank_all_params_name))
-        ids = [all_params_name.index(name) for name in common]
-        all_params = [param for idx, param in enumerate(all_params) if idx in ids]
+    if len(all_params_name) == len(peer_rank_all_params_name):
+        assert all_params_name == peer_rank_all_params_name, (
+            "Elastic EP weight transfer: sender/receiver parameter lists differ"
+        )
+        common_names = all_params_name
+    else:
+        common_names = sorted(set(all_params_name) & set(peer_rank_all_params_name))
+        assert common_names, "Elastic EP weight transfer: sender/receiver parameter lists have no names in common"
+
+    name_to_param = dict(zip(all_params_name, all_params))
+    all_params = [name_to_param[name] for name in common_names]
 
     assert len(all_params) > 0
     p2p_ops = []
     for param in all_params:
+        transfer_param = param.contiguous()
         op = object.__new__(P2POp)
-        if is_sender:
-            op.op = torch.distributed.isend
-            op.tensor = param
-        else:
-            op.op = torch.distributed.irecv
-            op.tensor = param
+        op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
+        op.tensor = transfer_param
         op.group_peer = peer_rank
         p2p_ops.append(op)
-
-    device_comm.batch_isend_irecv(p2p_ops)
+        if transfer_param is not param:
+            device_comm.batch_isend_irecv(p2p_ops)
+            p2p_ops.clear()
+            if not is_sender:
+                param.copy_(transfer_param)
+    if p2p_ops:
+        device_comm.batch_isend_irecv(p2p_ops)
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):

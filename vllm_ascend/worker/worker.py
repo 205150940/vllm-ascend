@@ -1445,6 +1445,9 @@ class NPUWorker(GPUWorker):
         return
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        assert self.elastic_ep_executor is not None, (
+            "elastic_ep_execute requires elastic EP to be enabled (--enable-elastic-ep)"
+        )
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
