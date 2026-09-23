@@ -14,9 +14,11 @@ from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
+    get_standby_ep_group,
     get_standby_eplb_group,
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
+from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
@@ -271,7 +273,16 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             master_ip=reconfig_request.new_data_parallel_master_ip,
             coord_store_port=reconfig_request.coord_store_port,
         )
-        self.stage_standby_moe_quant_methods()
+        # Upstream stages the standby all2all manager's EP size and passes it
+        # to the staged MoE quant methods. Ascend never reuses fused-MoE
+        # kernels, so the staging always runs (mirrors upstream's non-reuse
+        # branch).
+        standby_ep_group = get_standby_ep_group()
+        assert standby_ep_group is not None
+        all2all_manager = get_ep_all2all_manager(standby_ep_group)
+        all2all_manager.stage_ep_size()
+        if not self._can_reuse_fused_moe_kernel():
+            self.stage_standby_moe_quant_methods(all2all_manager)
         self._prepare_eplb_communicator(get_standby_eplb_group())
         if new_dp_size > old_dp_size:
             self.transfer_weights(old_dp_size, new_dp_size)
@@ -353,7 +364,14 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # (DP sync on cpu_group, MoE on MC2, EPLB on gloo), so skip the warm.
         return
 
-    def warmup_local_kernels(self) -> None:
+    def _can_reuse_fused_moe_kernel(self) -> bool:
+        # Reuse requires the nixl_ep all2all backend (CUDA-only); NPU always
+        # takes the non-reuse path and re-captures ACL graphs.
+        return False
+
+    def warmup_new_worker(self) -> None:
+        # Upstream warms local kernels here (and re-captures graphs on the
+        # kernel-reuse path); Ascend skips the kernel warmup.
         pass
 
     def warm_and_capture(self) -> None:
