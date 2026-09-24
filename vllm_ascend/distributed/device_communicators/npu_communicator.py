@@ -134,9 +134,7 @@ class _NpuAll2AllManager:
             if not masked and rank in _NpuAll2AllManager._dead:
                 # Recovery must stop outstanding device work before unmasking.
                 self.clean_buffers()
-            _NpuAll2AllManager._mega_moe_buffer.update_mask_buffer(
-                _NpuAll2AllManager._ep_to_mc2[rank], masked
-            )
+            _NpuAll2AllManager._mega_moe_buffer.update_mask_buffer(_NpuAll2AllManager._ep_to_mc2[rank], masked)
             _accelerator_synchronize()
         if masked:
             _NpuAll2AllManager._dead.add(rank)

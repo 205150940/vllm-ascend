@@ -397,17 +397,12 @@ class FusedMC2CommImpl(MoECommMethod):
             )
             return
         try:
-            get_ep_all2all_manager().bind_mega_moe_buffer(
-                symm_buffer, list(range(get_mc2_group().world_size))
-            )
+            get_ep_all2all_manager().bind_mega_moe_buffer(symm_buffer, list(range(get_mc2_group().world_size)))
         except Exception:
             try:
                 symm_buffer.destroy()
             except Exception:
-                logger.exception(
-                    "Failed to release MegaMoe buffer after mask-buffer "
-                    "binding failed."
-                )
+                logger.exception("Failed to release MegaMoe buffer after mask-buffer binding failed.")
             raise
 
     def _apply_cann_mega_moe(
