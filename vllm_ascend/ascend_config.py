@@ -33,7 +33,12 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
-from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    DeviceAdaptorFamily,
+    HardwareCapability,
+    MoECommPolicy,
+    get_current_hardware_profile,
+)
 from vllm_ascend.distributed.expert_transfer.expert_offload_config import validate_expert_offload_config
 from vllm_ascend.kv_trace.kv_trace_config import KVTraceConfig
 
@@ -1250,6 +1255,22 @@ class AscendConfig:
             moe_intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if moe_intermediate_size is None:
             return False
+        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
+        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
+        # TEMPORARY WORKAROUND: allow intermediate_size=768 to bypass the
+        # minimum-size and alignment checks only for A3 W8A8 fault tolerance.
+        # This requires the matching locally patched CANN operator and does
+        # not imply general support for non-512-aligned dimensions.
+        if (
+            moe_intermediate_size == 768
+            and quant_name in {"w8a8", "w8a8_dynamic", "quanttype.w8a8"}
+            and get_current_hardware_profile().moe_comm_policy is MoECommPolicy.FUSED_OR_CAPACITY
+            and getattr(getattr(vllm_config, "parallel_config", None), "enable_fault_tolerance", False)
+        ):
+            logger.warning_once(
+                "A3 W8A8 768 MegaMoe fault tolerance requires the matching patched CANN operator build."
+            )
+            return True
         # intermediate_hidden (the post-activation intermediate width) must be in
         # [256, 4096] and aligned to 128.
         # Actual operator bounds: A5 supports [256, 4096] aligned to 128; the A3
@@ -1302,10 +1323,8 @@ class AscendConfig:
             )
             return False
 
-        quant_type = getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
         if quant_type is None:
             return True
-        quant_name = str(getattr(quant_type, "name", quant_type)).lower()
         supported_quant_names = {
             "w8a8",
             "w4a8",
