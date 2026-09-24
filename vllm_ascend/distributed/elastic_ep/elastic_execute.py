@@ -26,6 +26,8 @@ from vllm.v1.engine import ReconfigureDistributedRequest
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
+from vllm_ascend import envs
+from vllm_ascend.ascend_forward_context import use_cann_megamoe
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     reset_graph_params,
@@ -278,16 +280,24 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         standby_eplb_group = get_standby_eplb_group()
         if standby_eplb_group is not None:
             register_stateless_coordinator_pgs(standby_eplb_group)
-        create_ascend_standby_groups(
-            new_dp_size=new_dp_size,
-            new_world_size_across_dp=new_world_size_across_dp,
-            master_ip=reconfig_request.new_data_parallel_master_ip,
-            coord_store_port=reconfig_request.coord_store_port,
-        )
-        # Upstream stages the standby all2all manager's EP size and passes it
-        # to the staged MoE quant methods. Ascend never reuses fused-MoE
-        # kernels, so the staging always runs (mirrors upstream's non-reuse
-        # branch).
+        if self._can_reuse_fused_moe_kernel():
+            # Scale-down graph reuse keeps the CURRENT MC2 group alive:
+            # captured graphs reference its HCCL comm name and the MegaMoe
+            # symmetric buffer that was handshaked over it. Creating (and
+            # later switching to) a standby MC2 group would invalidate
+            # every graph, which is exactly what the reuse path avoids.
+            # Control-plane groups (world/dp/ep/eplb) are still recreated.
+            pass
+        else:
+            create_ascend_standby_groups(
+                new_dp_size=new_dp_size,
+                new_world_size_across_dp=new_world_size_across_dp,
+                master_ip=reconfig_request.new_data_parallel_master_ip,
+                coord_store_port=reconfig_request.coord_store_port,
+            )
+        # Upstream stages the standby all2all manager's EP size and passes
+        # it to the staged MoE quant methods. The staging only runs on the
+        # non-reuse path (mirrors upstream's branch).
         standby_ep_group = get_standby_ep_group()
         assert standby_ep_group is not None
         all2all_manager = get_ep_all2all_manager(standby_ep_group)
@@ -348,10 +358,29 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             retired_mc2.destroy()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        reuse = self._can_reuse_fused_moe_kernel()
+        # Upstream's reuse branch skips _release_cuda_graphs; group swap,
+        # parallel_config update and EPLB re-configuration still run.
         retired_groups = super().switch_and_prepare()
-        retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
         self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
         self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
+        if reuse:
+            # Keep the MC2 group alive and DO NOT rebuild the MoE comm
+            # methods: the captured graphs reference the old MC2 group's
+            # HCCL comm name, the MegaMoe symmetric buffer handshaked over
+            # it, and the dispatcher/comm-impl objects built against them.
+            # Membership changes were already applied as mask writes on
+            # the long-lived buffer (see commit_scale_down).
+            moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
+            for module in moe_modules:
+                module.moe_config.tp_group = get_tp_group()
+                module.moe_config.dp_group = get_dp_group()
+                module.moe_config.ep_group = get_ep_group()
+                # moe_config.mc2_group intentionally NOT refreshed: it must
+                # keep pointing at the pre-switch MC2 group that the
+                # captured graphs were built against.
+            return retired_groups
+        retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
         moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
@@ -376,9 +405,64 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         return
 
     def _can_reuse_fused_moe_kernel(self) -> bool:
-        # Reuse requires the nixl_ep all2all backend (CUDA-only); NPU always
-        # takes the non-reuse path and re-captures ACL graphs.
-        return False
+        # Graph reuse across Elastic EP reconfiguration is supported on the
+        # CANN MegaMoe backend for scale-down only: the MegaMoe symmetric
+        # buffer's device-side rank mask lets captured ACL graphs skip the
+        # removed ranks without re-capture (mirrors upstream nixl_ep's
+        # mask semantics). Scale-up would additionally require attaching
+        # new ranks to the existing symmetric buffer (latecomer connect),
+        # which CANN does not expose, so it keeps the re-capture path.
+        if not envs.VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE:
+            return False
+        if not use_cann_megamoe(self.worker.vllm_config):
+            return False
+        if not get_ep_all2all_manager().uses_mega_moe:
+            # The mask buffer is bound lazily at the first MegaMoe forward
+            # (during warmup). Unbound means reuse was not prepared.
+            return False
+        reconfig_request = self.reconfig_request
+        if reconfig_request is None:
+            return False
+        return reconfig_request.new_data_parallel_size < get_dp_group().world_size
+
+    def _mask_removed_ep_ranks(self, new_dp_size: int) -> None:
+        """Mask the removed EP ranks on the MegaMoe buffer (in place).
+
+        Must run after perform_scale_down_eplb_reshuffle moved the experts
+        off the removed ranks and before switch_and_prepare updates the
+        parallel config: the old EP size is derived from the still-active
+        DP group. Masking is a data update on the long-lived buffer, so
+        captured graphs re-read it on their next replay.
+        """
+        tp_size = self.worker.vllm_config.parallel_config.tensor_parallel_size
+        old_ep_size = get_dp_group().world_size * tp_size
+        new_ep_size = new_dp_size * tp_size
+        manager = get_ep_all2all_manager()
+        assert manager.uses_mega_moe, (
+            "Scale-down graph reuse requires the MegaMoe mask buffer bound at warmup."
+        )
+        for ep_rank in range(new_ep_size, old_ep_size):
+            manager.update_mask(ep_rank, masked=True)
+        torch.npu.synchronize()
+
+    def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
+        if not removing and self._can_reuse_fused_moe_kernel():
+            # Scale-down with graph reuse:
+            # 1. move experts off the removed ranks while they are alive
+            #    (collective EPLB redistribute over the old groups);
+            # 2. mask the removed ranks — a data update, graphs stay valid;
+            # 3. switch control-plane groups only (world/dp/ep/eplb);
+            # 4. skip warm_and_capture entirely: graphs replay against the
+            #    still-bound MegaMoe buffer and re-read the updated mask.
+            self.perform_scale_down_eplb_reshuffle(new_dp_size)
+            self._mask_removed_ep_ranks(new_dp_size)
+            retired_groups = self.switch_and_prepare()
+            self._start_group_cleanup(retired_groups)
+            # Publish the mask and EPLB routing-table updates to the device
+            # before the next captured graph replay can observe them.
+            torch.npu.synchronize()
+            return
+        super().commit_scale_down(new_dp_size, removing)
 
     def warmup_new_worker(self) -> None:
         # Upstream warms local kernels here (and re-captures graphs on the
