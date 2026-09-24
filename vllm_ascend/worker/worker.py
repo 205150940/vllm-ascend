@@ -422,9 +422,10 @@ class NPUWorker(WorkerBase):
                         "must be greater than HCCL_EXEC_TIMEOUT "
                         f"({os.environ['HCCL_EXEC_TIMEOUT']})"
                     )
-                if int(os.environ["HCCL_EVENT_TIMEOUT"]) != abort_timeout or int(
-                    os.environ["HCCL_EXEC_TIMEOUT"]
-                ) != abort_timeout - 1:
+                if (
+                    int(os.environ["HCCL_EVENT_TIMEOUT"]) != abort_timeout
+                    or int(os.environ["HCCL_EXEC_TIMEOUT"]) != abort_timeout - 1
+                ):
                     logger.warning(
                         "Fault tolerance: HCCL communication timeouts are taken from the "
                         "HCCL_EVENT_TIMEOUT (%s s) / HCCL_EXEC_TIMEOUT (%s s) environment "
