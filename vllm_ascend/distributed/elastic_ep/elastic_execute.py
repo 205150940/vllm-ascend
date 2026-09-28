@@ -305,7 +305,9 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 # is then consumed through torch.distributed APIs (MegaMoe
                 # symm-buffer handshake). Register it now, paired with the
                 # unregistration in _destroy_retired_groups.
-                register_stateless_coordinator_pgs(standby_mc2_group)
+                register_stateless_coordinator_pgs(
+                    standby_mc2_group, include_device_group=True
+                )
         # Upstream stages the standby all2all manager's EP size and passes
         # it to the staged MoE quant methods. The staging only runs on the
         # non-reuse path (mirrors upstream's branch).

@@ -1259,7 +1259,9 @@ class NPUWorker(WorkerBase):
                 register_stateless_coordinator_pgs(eplb_group)
             mc2_group = get_mc2_group()
             if isinstance(mc2_group, StatelessGroupCoordinator):
-                register_stateless_coordinator_pgs(mc2_group)
+                # MegaMoe's symm-buffer handshake resolves ranks on the MC2
+                # HCCL device group through torch.distributed APIs.
+                register_stateless_coordinator_pgs(mc2_group, include_device_group=True)
             print(
                 f"[pid {os.getpid()}][EEP] registered stateless PGs: "
                 f"eplb={eplb_group.unique_name} device_group={id(eplb_group.device_group)}; "

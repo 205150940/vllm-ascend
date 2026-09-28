@@ -389,7 +389,7 @@ class FusedMC2CommImpl(MoECommMethod):
             assert isinstance(coordinator, StatelessGroupCoordinator), (
                 "MegaMoe on elastic EP requires a stateless MC2 group."
             )
-            register_stateless_coordinator_pgs(coordinator)
+            register_stateless_coordinator_pgs(coordinator, include_device_group=True)
             print(
                 f"[pid {os.getpid()}][EEP mask] registered MC2 stateless PGs "
                 f"on demand before symm-buffer handshake "
