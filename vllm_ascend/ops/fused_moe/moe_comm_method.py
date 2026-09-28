@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -49,6 +50,7 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 )
 from vllm_ascend.quantization.quant_type import QuantType
 
+_MEGA_MOE_BRANCH_PRINTED: set[bool] = set()
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
@@ -527,7 +529,11 @@ class FusedMC2CommImpl(MoECommMethod):
 
         expert_tokens = None
         if self.enable_fused_mc2 == 1:
-            if _EXTRA_CTX.use_mega_moe:
+            use_mega = bool(_EXTRA_CTX.use_mega_moe)
+            if use_mega not in _MEGA_MOE_BRANCH_PRINTED:
+                _MEGA_MOE_BRANCH_PRINTED.add(use_mega)
+                print(f"[pid {os.getpid()}][mega_moe] fused_experts branch taken: use_mega_moe={use_mega}")
+            if use_mega:
                 out, expert_tokens = self._apply_cann_mega_moe(
                     fused_experts_input, weights, is_decode_only_node=_EXTRA_CTX.is_decode_only_node
                 )

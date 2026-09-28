@@ -958,8 +958,9 @@ class AscendConfig:
             and get_current_hardware_profile().moe_comm_policy is MoECommPolicy.FUSED_OR_CAPACITY
             and getattr(getattr(vllm_config, "parallel_config", None), "enable_fault_tolerance", False)
         ):
-            logger.warning_once(
-                "A3 W8A8 768 MegaMoe fault tolerance requires the matching patched CANN operator build."
+            print(
+                f"[pid {os.getpid()}][mega_moe] A3 W8A8 768 MegaMoe fault "
+                "tolerance requires the matching patched CANN operator build."
             )
             return True
         if moe_intermediate_size < 1024 or moe_intermediate_size > 3072 or moe_intermediate_size % 512 != 0:

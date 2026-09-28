@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -23,11 +24,8 @@ import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
 from vllm.distributed.utils import StatelessProcessGroup
-from vllm.logger import init_logger
 
 from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
-
-logger = init_logger(__name__)
 
 
 def _accelerator_synchronize() -> None:
@@ -74,10 +72,9 @@ class _NpuAll2AllManager:
             # built for scale-down) must not shrink the bound space: mask
             # indices and the captured graphs stay in the original rank
             # space of the buffer that was bound at startup.
-            logger.debug(
-                "Ignoring EP world size %d (bound space stays %d).",
-                ep_world_size,
-                cls._ep_world_size,
+            print(
+                f"[EEP mask] ignoring EP world size {ep_world_size} "
+                f"(bound space stays {cls._ep_world_size})"
             )
 
     @property
@@ -119,9 +116,9 @@ class _NpuAll2AllManager:
             buffer.update_mask_buffer(ep_to_mc2[rank], True)
         _NpuAll2AllManager._ep_to_mc2 = tuple(ep_to_mc2)
         _NpuAll2AllManager._mega_moe_buffer = buffer
-        logger.info(
-            "Bound MegaMoe rank-mask buffer for %d EP ranks before graph capture.",
-            ep_world_size,
+        print(
+            f"[pid {os.getpid()}][EEP mask] Bound MegaMoe rank-mask buffer for "
+            f"{ep_world_size} EP ranks before graph capture."
         )
 
     @torch.inference_mode()

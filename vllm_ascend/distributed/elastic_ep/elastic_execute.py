@@ -2,6 +2,7 @@
 # NPU/ACL graphs, quantized weight transfer, MC2 comm groups, PyHccl EPLB.
 
 import gc
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -435,7 +436,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if gate_key not in _EEP_GATE_PRINTED:
             _EEP_GATE_PRINTED.add(gate_key)
             print(
-                "[EEP graph reuse gate] "
+                f"[pid {os.getpid()}][EEP graph reuse gate] "
                 + ("False (" + gate_key + ")" if reasons else "True")
             )
         return not reasons

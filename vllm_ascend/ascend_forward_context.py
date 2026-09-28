@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -84,17 +85,33 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+_USE_CANN_MEGAMOE_PRINTED: set[str] = set()
+
+
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
+    # Evaluate every guard individually so a False return can be traced to
+    # the exact failing condition. Printed once per distinct reason set to
+    # stay quiet in per-forward hot paths.
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
-    return (
-        is_mega_moe_supported()
-        and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE)
-        and get_ascend_config().enable_fused_mc2 == 1
-        and is_moe_model(vllm_config)
-        and vllm_config.parallel_config.enable_expert_parallel
-        and 1 < get_ep_group().world_size <= 64
-        and getattr(vllm_config, "lora_config", None) is None
-    )
+    conditions = {
+        "cann_ops_transformer package available and model passed "
+        "MegaMoe config validation": is_mega_moe_supported(),
+        "hardware profile supports CANN_MEGAMOE": get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE
+        ),
+        "enable_fused_mc2 == 1": get_ascend_config().enable_fused_mc2 == 1,
+        "MoE model": is_moe_model(vllm_config),
+        "expert parallelism enabled": vllm_config.parallel_config.enable_expert_parallel,
+        "1 < ep_world_size <= 64": 1 < get_ep_group().world_size <= 64,
+        "no LoRA attached": getattr(vllm_config, "lora_config", None) is None,
+    }
+    failed = [name for name, satisfied in conditions.items() if not satisfied]
+    signature = "; ".join(failed) if failed else "all conditions met"
+    if signature not in _USE_CANN_MEGAMOE_PRINTED:
+        _USE_CANN_MEGAMOE_PRINTED.add(signature)
+        state = "False, unmet conditions: " + signature if failed else "True"
+        print(f"[pid {os.getpid()}][use_cann_megamoe] {state}")
+    return not failed
 
 
 @contextmanager
@@ -364,6 +381,9 @@ _MOE_COMM_SELECTORS = {
 }
 
 
+_MOE_COMM_SELECT_PRINTED: set[tuple[str, str]] = set()
+
+
 def select_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
@@ -416,6 +436,13 @@ def select_moe_comm_method(
         is_draft_model,
         draft_moe_quant_type,
     )
+    key = (str(moe_comm_policy), str(moe_comm_type))
+    if key not in _MOE_COMM_SELECT_PRINTED:
+        _MOE_COMM_SELECT_PRINTED.add(key)
+        print(
+            f"[pid {os.getpid()}][moe_comm] selected {moe_comm_type} "
+            f"(policy={moe_comm_policy}, num_tokens={num_tokens})"
+        )
     return moe_comm_type
 
 
