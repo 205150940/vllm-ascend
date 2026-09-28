@@ -365,18 +365,33 @@ class FusedMC2CommImpl(MoECommMethod):
             getattr(self.token_dispatcher, "ep_world_size", "?"),
             self.token_dispatcher.global_bs,
         )
+        from torch.distributed.distributed_c10d import _world
 
-        return self.get_symm_buffer_for_mega_moe(
-            group,
-            num_experts,
-            num_max_tokens_per_rank,
-            num_topk,
-            hidden=self.moe_config.hidden_dim,
-            intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
-            max_recv_token_num=max_recv_token_num,
-            dispatch_quant_mode=dispatch_quant_mode,
-            dispatch_quant_out_dtype=dispatch_quant_out_dtype,
+        print(
+            f"[pid {os.getpid()}][mega_moe] handshake group diag: "
+            f"group_id={id(group)} group_name={getattr(group, 'group_name', None)} "
+            f"size={group.size()} in_pg_map={group in _world.pg_map} "
+            f"in_pg_group_ranks={group in _world.pg_group_ranks} "
+            f"mc2_is_stateless={type(get_mc2_group()).__name__}"
         )
+
+        try:
+            return self.get_symm_buffer_for_mega_moe(
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden=self.moe_config.hidden_dim,
+                intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
+                max_recv_token_num=max_recv_token_num,
+                dispatch_quant_mode=dispatch_quant_mode,
+                dispatch_quant_out_dtype=dispatch_quant_out_dtype,
+            )
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            raise
 
     def _maybe_bind_mask_buffer(self, symm_buffer) -> None:
         """Bind the MegaMoe rank-mask buffer before any graph is captured.

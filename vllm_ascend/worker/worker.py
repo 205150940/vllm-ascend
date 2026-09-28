@@ -21,6 +21,7 @@ import copy
 import gc
 import inspect
 import logging
+import os
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import Any
@@ -1259,6 +1260,12 @@ class NPUWorker(WorkerBase):
             mc2_group = get_mc2_group()
             if isinstance(mc2_group, StatelessGroupCoordinator):
                 register_stateless_coordinator_pgs(mc2_group)
+            print(
+                f"[pid {os.getpid()}][EEP] registered stateless PGs: "
+                f"eplb={eplb_group.unique_name} device_group={id(eplb_group.device_group)}; "
+                f"mc2={mc2_group.unique_name} device_group={id(mc2_group.device_group)} "
+                f"mc2_type={type(mc2_group).__name__}"
+            )
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
