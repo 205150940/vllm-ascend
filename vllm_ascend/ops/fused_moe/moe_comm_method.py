@@ -30,6 +30,7 @@ from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
@@ -374,6 +375,26 @@ class FusedMC2CommImpl(MoECommMethod):
             f"in_pg_group_ranks={group in _world.pg_group_ranks} "
             f"mc2_is_stateless={type(get_mc2_group()).__name__}"
         )
+        if group not in _world.pg_group_ranks:
+            # The elastic MC2 group is stateless and is not auto-registered
+            # in torch's ``_world``; the CANN symm-buffer handshake resolves
+            # ranks through torch.distributed module-level APIs and needs
+            # the registration. Register on demand (idempotent) in case the
+            # startup-time registration did not run in this process.
+            from vllm_ascend.distributed.stateless_coordinator import (
+                register_stateless_coordinator_pgs,
+            )
+
+            coordinator = get_mc2_group()
+            assert isinstance(coordinator, StatelessGroupCoordinator), (
+                "MegaMoe on elastic EP requires a stateless MC2 group."
+            )
+            register_stateless_coordinator_pgs(coordinator)
+            print(
+                f"[pid {os.getpid()}][EEP mask] registered MC2 stateless PGs "
+                f"on demand before symm-buffer handshake "
+                f"(in_pg_group_ranks={group in _world.pg_group_ranks})"
+            )
 
         try:
             return self.get_symm_buffer_for_mega_moe(
