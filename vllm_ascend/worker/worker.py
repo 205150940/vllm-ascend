@@ -97,7 +97,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     plan_sparse_kv_offload_memory,
 )
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.parallel_state import get_mc2_group, init_ascend_model_parallel
 from vllm_ascend.distributed.stateless_coordinator import (
     register_stateless_coordinator_pgs,
 )
@@ -1242,16 +1242,23 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.parallel_config.enable_elastic_ep:
-            # Only the stateless EPLB group's torch PGs are consumed through
-            # torch.distributed module-level APIs (the gloo staged EPLB
-            # communicator and the dynamic-EPLB P2P transfer pass global
-            # ranks); world/dp/ep groups talk through coordinator methods
-            # (PyHccl / TCP store) and never consult ``_world``. Retired
-            # groups are unregistered in
+            # Stateless groups whose torch PGs are consumed through
+            # torch.distributed module-level APIs must be registered here:
+            # - the EPLB group (the gloo staged EPLB communicator and the
+            #   dynamic-EPLB P2P transfer pass global ranks), and
+            # - the MC2 group when MegaMoe is active: the CANN symm-buffer
+            #   handshake resolves ranks via ``get_group_rank`` on the HCCL
+            #   device group.
+            # Other stateless groups (world/dp/ep) talk through coordinator
+            # methods (PyHccl / TCP store) and never consult ``_world``.
+            # Retired groups are unregistered in
             # AscendElasticEPScalingExecutor._destroy_retired_groups.
             eplb_group = get_eplb_group()
             if isinstance(eplb_group, StatelessGroupCoordinator):
                 register_stateless_coordinator_pgs(eplb_group)
+            mc2_group = get_mc2_group()
+            if isinstance(mc2_group, StatelessGroupCoordinator):
+                register_stateless_coordinator_pgs(mc2_group)
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
