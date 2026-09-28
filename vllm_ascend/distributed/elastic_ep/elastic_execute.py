@@ -50,6 +50,8 @@ from vllm_ascend.distributed.stateless_coordinator import (
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 
+_EEP_GATE_PRINTED: set[str] = set()
+
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
     if isinstance(
@@ -412,18 +414,31 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         # mask semantics). Scale-up would additionally require attaching
         # new ranks to the existing symmetric buffer (latecomer connect),
         # which CANN does not expose, so it keeps the re-capture path.
+        reasons: list[str] = []
         if not envs.VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE:
-            return False
+            reasons.append("env VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE is not set to 1")
         if not use_cann_megamoe(self.worker.vllm_config):
-            return False
-        if not get_ep_all2all_manager().uses_mega_moe:
+            reasons.append("use_cann_megamoe=False (see its own unmet-conditions log)")
+        elif not get_ep_all2all_manager().uses_mega_moe:
             # The mask buffer is bound lazily at the first MegaMoe forward
             # (during warmup). Unbound means reuse was not prepared.
-            return False
+            reasons.append("MegaMoe mask buffer was not bound at warmup")
         reconfig_request = self.reconfig_request
         if reconfig_request is None:
-            return False
-        return reconfig_request.new_data_parallel_size < get_dp_group().world_size
+            reasons.append("no pending reconfig request")
+        elif reconfig_request.new_data_parallel_size >= get_dp_group().world_size:
+            reasons.append(
+                f"not a scale-down ({get_dp_group().world_size} -> "
+                f"{reconfig_request.new_data_parallel_size}); scale-up always re-captures"
+            )
+        gate_key = "; ".join(reasons) if reasons else "OK"
+        if gate_key not in _EEP_GATE_PRINTED:
+            _EEP_GATE_PRINTED.add(gate_key)
+            print(
+                "[EEP graph reuse gate] "
+                + ("False (" + gate_key + ")" if reasons else "True")
+            )
+        return not reasons
 
     def _mask_removed_ep_ranks(self, new_dp_size: int) -> None:
         """Mask the removed EP ranks on the MegaMoe buffer (in place).

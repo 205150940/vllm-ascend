@@ -391,9 +391,9 @@ class FusedMC2CommImpl(MoECommMethod):
         if get_ep_group().ranks != get_mc2_group().ranks:
             # Mask translation between EP and MC2 rank spaces assumes the
             # two groups share the rank layout (identity mapping).
-            logger.warning_once(
-                "Elastic EP graph reuse requires identical EP and MC2 rank "
-                "order; skipping MegaMoe mask-buffer binding (reuse disabled)."
+            print(
+                "[EEP mask] Elastic EP graph reuse requires identical EP and "
+                "MC2 rank order; skipping MegaMoe mask-buffer binding (reuse disabled)."
             )
             return
         try:
@@ -404,9 +404,9 @@ class FusedMC2CommImpl(MoECommMethod):
             try:
                 symm_buffer.destroy()
             except Exception:
-                logger.exception(
-                    "Failed to release MegaMoe buffer after mask-buffer "
-                    "binding failed."
+                print(
+                    "[EEP mask] Failed to release MegaMoe buffer after "
+                    "mask-buffer binding failed."
                 )
             raise
 
