@@ -438,9 +438,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         old_ep_size = get_dp_group().world_size * tp_size
         new_ep_size = new_dp_size * tp_size
         manager = get_ep_all2all_manager()
-        assert manager.uses_mega_moe, (
-            "Scale-down graph reuse requires the MegaMoe mask buffer bound at warmup."
-        )
+        assert manager.uses_mega_moe, "Scale-down graph reuse requires the MegaMoe mask buffer bound at warmup."
         for ep_rank in range(new_ep_size, old_ep_size):
             manager.update_mask(ep_rank, masked=True)
         torch.npu.synchronize()
