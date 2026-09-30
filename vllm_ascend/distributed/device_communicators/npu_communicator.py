@@ -33,12 +33,14 @@ from vllm_ascend.distributed.device_communicators.mxfp8_all_reduce import Mxfp8A
 
 from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
-
 def _accelerator_synchronize() -> None:
     # torch.accelerator APIs raise on CPU-only builds; the mask manager is
     # unit-testable without a device, so guard the synchronize.
     if torch.accelerator.is_available():
         torch.accelerator.synchronize()
+
+
+logger = init_logger(__name__)
 
 
 class _NpuAll2AllManager:
@@ -71,18 +73,12 @@ class _NpuAll2AllManager:
 
     @classmethod
     def bind_ep_world_size(cls, ep_world_size: int) -> None:
+        # Coordinators created later (e.g. a smaller standby EP group built
+        # for scale-down) must not shrink the bound space: mask indices and
+        # the captured graphs stay in the original rank space of the buffer
+        # that was bound at startup — later bindings are silently ignored.
         if cls._ep_world_size == 0:
             cls._ep_world_size = ep_world_size
-        elif cls._ep_world_size != ep_world_size:
-            # Coordinators created later (e.g. a smaller standby EP group
-            # built for scale-down) must not shrink the bound space: mask
-            # indices and the captured graphs stay in the original rank
-            # space of the buffer that was bound at startup.
-            logger.debug(
-                "Ignoring EP world size %d (bound space stays %d).",
-                ep_world_size,
-                cls._ep_world_size,
-            )
 
     @property
     def uses_mega_moe(self) -> bool:
