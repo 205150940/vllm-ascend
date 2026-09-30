@@ -36,6 +36,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.distributed.elastic_ep.standby_state import (
     create_ascend_standby_groups,
+    get_ascend_standby_mc2_group,
     pop_ascend_standby_groups,
 )
 from vllm_ascend.distributed.parallel_state import (
@@ -295,6 +296,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
                 master_ip=reconfig_request.new_data_parallel_master_ip,
                 coord_store_port=reconfig_request.coord_store_port,
             )
+            standby_mc2_group = get_ascend_standby_mc2_group()
+            if isinstance(standby_mc2_group, StatelessGroupCoordinator):
+                # The standby MC2 group becomes active after the switch and
+                # is then consumed through torch.distributed APIs (MegaMoe
+                # symm-buffer handshake). Register it now, paired with the
+                # unregistration in _destroy_retired_groups.
+                register_stateless_coordinator_pgs(
+                    standby_mc2_group, include_device_group=True
+                )
         # Upstream stages the standby all2all manager's EP size and passes
         # it to the staged MoE quant methods. The staging only runs on the
         # non-reuse path (mirrors upstream's branch).

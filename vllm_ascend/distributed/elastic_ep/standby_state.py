@@ -45,6 +45,11 @@ def create_ascend_standby_groups(
     )
 
 
+def get_ascend_standby_mc2_group() -> StatelessGroupCoordinator | None:
+    """Return the standby MC2 group without consuming it."""
+    return _STANDBY_MC2
+
+
 def pop_ascend_standby_groups() -> dict:
     """Return all standby groups and clear the standby state."""
     global _STANDBY_MC2
