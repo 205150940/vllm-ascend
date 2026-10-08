@@ -36,7 +36,6 @@ from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     ensure_model_parallel_initialized,
-    get_eplb_group,
     get_pcp_group,
     init_distributed_environment,
 )
@@ -55,7 +54,6 @@ from vllm.distributed.kv_transfer import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.distributed.parallel_state import get_world_group
-from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -115,10 +113,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
-from vllm_ascend.distributed.parallel_state import get_mc2_group, init_ascend_model_parallel
-from vllm_ascend.distributed.stateless_coordinator import (
-    register_stateless_coordinator_pgs,
-)
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -1398,26 +1393,6 @@ class NPUWorker(GPUWorker):
             )
         init_ascend_model_parallel(self.parallel_config, self.vllm_config.engram_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-        if self.parallel_config.enable_elastic_ep:
-            # Stateless groups whose torch PGs are consumed through
-            # torch.distributed module-level APIs must be registered here:
-            # - the EPLB group (the gloo staged EPLB communicator and the
-            #   dynamic-EPLB P2P transfer pass global ranks), and
-            # - the MC2 group when MegaMoe is active: the CANN symm-buffer
-            #   handshake resolves ranks via ``get_group_rank`` on the HCCL
-            #   device group.
-            # Other stateless groups (world/dp/ep) talk through coordinator
-            # methods (PyHccl / TCP store) and never consult ``_world``.
-            # Retired groups are unregistered in
-            # AscendElasticEPScalingExecutor._destroy_retired_groups.
-            eplb_group = get_eplb_group()
-            if isinstance(eplb_group, StatelessGroupCoordinator):
-                register_stateless_coordinator_pgs(eplb_group)
-            mc2_group = get_mc2_group()
-            if isinstance(mc2_group, StatelessGroupCoordinator):
-                # MegaMoe's symm-buffer handshake resolves ranks on the MC2
-                # HCCL device group through torch.distributed APIs.
-                register_stateless_coordinator_pgs(mc2_group, include_device_group=True)
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
