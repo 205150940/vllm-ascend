@@ -695,14 +695,10 @@ class NPUPlatform(Platform):
             hccl_comm_name = pg.get_group_store().get("hccl_comm_name").decode("utf-8")
 
         backend_options = ProcessGroupHCCL.Options()
-
         backend_options.group_id = hccl_comm_name
         backend_options._timeout = timeout
 
-        # Create Backend object
         backend = Backend("hccl")
-
-        # Set default backend for ProcessGroup
         pg._set_default_backend(Backend.backend_type_map[backend])
 
         device = torch.device("npu")
@@ -710,12 +706,10 @@ class NPUPlatform(Platform):
             backend_options._device = device
 
         backend_class = ProcessGroupHCCL(prefix_store, group_rank, group_size, backend_options)
-
         backend_class._set_sequence_number_for_group()
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
         backend_class._set_hccl_comm_name(hccl_comm_name)
-        pg._set_group_desc("undefined")
 
         return pg
 

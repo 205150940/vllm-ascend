@@ -25,12 +25,10 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm_ascend.ops.fused_moe import moe_utils
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInput
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
@@ -439,54 +437,27 @@ class FusedMC2CommImpl(MoECommMethod):
             getattr(self.token_dispatcher, "ep_world_size", "?"),
             self.token_dispatcher.global_bs,
         )
-        from torch.distributed.distributed_c10d import _world
-
-        if group not in _world.pg_group_ranks:
-            # The elastic MC2 group is stateless and is not auto-registered
-            # in torch's ``_world``; the CANN symm-buffer handshake resolves
-            # ranks through torch.distributed module-level APIs and needs
-            # the registration. Register on demand (idempotent) in case the
-            # startup-time registration did not run in this process.
-            from vllm_ascend.distributed.stateless_coordinator import (
-                register_stateless_coordinator_pgs,
-            )
-
-            coordinator = get_mc2_group()
-            assert isinstance(coordinator, StatelessGroupCoordinator), (
-                "MegaMoe on elastic EP requires a stateless MC2 group."
-            )
-            register_stateless_coordinator_pgs(coordinator, include_device_group=True)
-
-        try:
-            return self.get_symm_buffer_for_mega_moe(
-                group,
-                num_experts,
-                num_max_tokens_per_rank,
-                num_topk,
-                hidden=self.moe_config.hidden_dim,
-                intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
-                max_recv_token_num=max_recv_token_num,
-                dispatch_quant_mode=dispatch_quant_mode,
-                dispatch_quant_out_dtype=dispatch_quant_out_dtype,
-            )
-        except Exception:
-            import traceback
-
-            traceback.print_exc()
-            raise
+        return self.get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden=self.moe_config.hidden_dim,
+            intermediate_hidden=2 * self.moe_config.intermediate_size_per_partition,
+            max_recv_token_num=max_recv_token_num,
+            dispatch_quant_mode=dispatch_quant_mode,
+            dispatch_quant_out_dtype=dispatch_quant_out_dtype,
+        )
 
     def _maybe_bind_mask_buffer(self, symm_buffer) -> None:
-        """Bind the MegaMoe rank-mask buffer before any graph is captured.
+        """Bind the rank mask before any ACL graph is captured.
 
-        This runs during warmup (the symm buffer is created lazily by the
-        first forward, which is the profile/dummy run that precedes ACL
-        graph capture). A graph captured with an unbound mask buffer could
-        never honor a mask applied after ranks are removed, so binding
-        must happen exactly here. Only needed for the Elastic EP graph
-        reuse path; harmless otherwise because the mask starts all-zero.
+        The symm buffer is created lazily by the first forward (the
+        profile/dummy run preceding graph capture); this is the only
+        point where the binding can still precede capture. Enables
+        Elastic EP scale-down graph reuse; harmless otherwise (the mask
+        starts all-zero).
         """
-        if not envs.VLLM_ASCEND_ELASTIC_EP_GRAPH_REUSE:
-            return
         if get_ep_group().ranks != get_mc2_group().ranks:
             # Mask translation between EP and MC2 rank spaces assumes the
             # two groups share the rank layout (identity mapping).
@@ -496,17 +467,12 @@ class FusedMC2CommImpl(MoECommMethod):
             )
             return
         try:
-            get_ep_all2all_manager().bind_mega_moe_buffer(
-                symm_buffer, list(range(get_mc2_group().world_size))
-            )
+            get_ep_all2all_manager().bind_mega_moe_buffer(symm_buffer, list(range(get_mc2_group().world_size)))
         except Exception:
             try:
                 symm_buffer.destroy()
             except Exception:
-                logger.exception(
-                    "Failed to release MegaMoe buffer after mask-buffer "
-                    "binding failed."
-                )
+                logger.exception("Failed to release MegaMoe buffer after mask-buffer binding failed.")
             raise
 
     def _apply_cann_mega_moe(

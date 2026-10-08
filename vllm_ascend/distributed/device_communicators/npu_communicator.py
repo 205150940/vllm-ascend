@@ -15,8 +15,6 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -41,18 +39,12 @@ logger = init_logger(__name__)
 class _NpuAll2AllManager:
     """All2All-manager adapter for the CANN MegaMoe backend.
 
-    Mirrors the upstream ``All2AllManagerBase`` mask API consumed by the
-    Elastic EP executor. The MegaMoe symmetric buffer's device-side rank
-    mask is the communication-layer expression of EP membership: captured
-    ACL graphs replay against the same buffer and re-read the mask, so a
-    membership change becomes a data update on a long-lived buffer instead
-    of a comm-object swap (which would invalidate every captured graph).
-
-    All mutable state lives at class level on purpose, mirroring upstream
-    ``NixlEPAll2AllManager._buffer``: manager instances are created per
-    process-group communicator and are replaced when Elastic EP switches
-    groups, but the mask binding must outlive those switches so that
-    graphs captured before the switch stay valid after it.
+    Implements the upstream ``All2AllManagerBase`` mask API consumed by the
+    Elastic EP executor: EP membership changes become writes on the MegaMoe
+    symm buffer's device-side rank mask, so captured ACL graphs survive
+    them. Mutable state is class-level (mirroring upstream
+    ``NixlEPAll2AllManager._buffer``) because the binding must outlive the
+    executor's process-group switches.
     """
 
     # Class-level shared state: survives process-group switches.
@@ -68,10 +60,7 @@ class _NpuAll2AllManager:
 
     @classmethod
     def bind_ep_world_size(cls, ep_world_size: int) -> None:
-        # Coordinators created later (e.g. a smaller standby EP group built
-        # for scale-down) must not shrink the bound space: mask indices and
-        # the captured graphs stay in the original rank space of the buffer
-        # that was bound at startup — later bindings are silently ignored.
+        # First binding wins: graphs stay in the startup rank space.
         if cls._ep_world_size == 0:
             cls._ep_world_size = ep_world_size
 
@@ -79,22 +68,11 @@ class _NpuAll2AllManager:
     def uses_mega_moe(self) -> bool:
         return _NpuAll2AllManager._mega_moe_buffer is not None
 
-    @classmethod
-    def reset_for_test(cls) -> None:
-        cls._mega_moe_buffer = None
-        cls._ep_to_mc2 = ()
-        cls._ep_world_size = 0
-        cls._dead = set()
-        cls._mask = None
-
     @torch.inference_mode()
     def bind_mega_moe_buffer(self, buffer, ep_to_mc2: list[int]) -> None:
-        """Attach MegaMoe's stable rank mask before graph capture.
+        """Attach the rank mask before any ACL graph is captured.
 
-        Must run during warmup, i.e. before any ACL graph is captured: a
-        graph captured while ``mask_buffer`` is unbound cannot honor a
-        mask that only appears after ranks are removed. The CPU ``_dead``
-        set stays authoritative; binding propagates any already-recorded
+        The CPU ``_dead`` set stays authoritative; binding replays already
         dead ranks into the device mask.
         """
         ep_world_size = _NpuAll2AllManager._ep_world_size
@@ -129,9 +107,7 @@ class _NpuAll2AllManager:
             if not masked and rank in _NpuAll2AllManager._dead:
                 # Recovery must stop outstanding device work before unmasking.
                 self.clean_buffers()
-            _NpuAll2AllManager._mega_moe_buffer.update_mask_buffer(
-                _NpuAll2AllManager._ep_to_mc2[rank], masked
-            )
+            _NpuAll2AllManager._mega_moe_buffer.update_mask_buffer(_NpuAll2AllManager._ep_to_mc2[rank], masked)
             _accelerator_synchronize()
         if masked:
             _NpuAll2AllManager._dead.add(rank)
@@ -143,16 +119,14 @@ class _NpuAll2AllManager:
         return False
 
     def query_fault(self) -> torch.Tensor:
-        # MC2/MegaMoe kernels do not detect faults themselves; faults
-        # surface as aborted ops. Masking is driven by the executor.
+        # MegaMoe kernels do not self-detect faults; masking is executor-driven.
         return torch.zeros(1, dtype=torch.bool, device="cpu")
 
     def query_active_mask(self) -> torch.Tensor:
-        """EP-order liveness mask (0 = alive, 1 = dead), stable address.
+        """EP-order liveness mask (0 = alive), refreshed from ``_dead``.
 
-        Refreshed from the authoritative CPU ``_dead`` set on every call
-        so a tensor captured once in a graph keeps observing the latest
-        membership.
+        Stable address, so a tensor captured in a graph keeps observing
+        the latest membership.
         """
         ep_world_size = _NpuAll2AllManager._ep_world_size
         if ep_world_size == 0:
@@ -167,61 +141,18 @@ class _NpuAll2AllManager:
 
     @torch.inference_mode()
     def clean_buffers(self) -> None:
-        """Clear fused communication flags after a membership change.
-
-        Keeps dead ranks masked; only the local control flags are reset so
-        a recovery (unmask) does not observe stale pre-fault state.
-        """
+        """Clear fused-communication flags (dead ranks stay masked)."""
         if self.uses_mega_moe:
             _NpuAll2AllManager._mega_moe_buffer.get_local_buffer_tensor(torch.uint8).zero_()
             _accelerator_synchronize()
 
-    # Elastic-EP hooks added to All2AllManagerBase upstream. NPU does not
-    # have an incremental "connect ranks" primitive for the MegaMoe buffer
-    # (the buffer is created by a collective handshake over fixed
-    # membership), so staged sizing is not supported: masking is driven
-    # explicitly by AscendElasticEPScalingExecutor on the scale-down
-    # reuse path.
+    # Upstream stage/commit hooks; CANN has no incremental rank-connect for
+    # the symm buffer, so masking is driven by the EEP executor instead.
     def stage_ep_size(self) -> None:
         pass
 
     def commit_ep_size(self) -> None:
         pass
-
-    @contextmanager
-    def mask_remote_ranks(self) -> Iterator[None]:
-        """Temporarily mask every peer rank (self stays alive).
-
-        Used to isolate a warmup/dummy run from peers that are not
-        participating, e.g. when a new worker captures its graphs. No-op
-        unless the MegaMoe buffer has been bound.
-        """
-        buffer = _NpuAll2AllManager._mega_moe_buffer
-        ep_world_size = _NpuAll2AllManager._ep_world_size
-        if buffer is None or ep_world_size == 0:
-            yield
-            return
-        ep_to_mc2 = _NpuAll2AllManager._ep_to_mc2
-        # Mask every EP rank: replay/dummy traffic stays local. The caller
-        # is responsible for only using this around local-only execution.
-        # The writes stay in inference mode (the mask buffer is an
-        # inference tensor); the caller's body must NOT be wrapped, so the
-        # context only covers the mask updates themselves.
-        peers = [ep_to_mc2[r] for r in range(ep_world_size)]
-        with torch.inference_mode():
-            for mc2_rank in peers:
-                buffer.update_mask_buffer(mc2_rank, True)
-        _accelerator_synchronize()
-        try:
-            yield
-        finally:
-            with torch.inference_mode():
-                for mc2_rank in peers:
-                    # Restore only ranks that are not recorded dead.
-                    ep_rank = ep_to_mc2.index(mc2_rank)
-                    if ep_rank not in _NpuAll2AllManager._dead:
-                        buffer.update_mask_buffer(mc2_rank, False)
-            _accelerator_synchronize()
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
@@ -235,6 +166,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         global_world_size: int | None = None,
         tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
+        stateless: bool | None = None,
     ):
         super().__init__(
             cpu_group,
@@ -244,6 +176,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
             global_ranks,
             global_world_size,
             use_all2all,
+            stateless=stateless,
         )
         self.device = torch.npu.current_device()
 
