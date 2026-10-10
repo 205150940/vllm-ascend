@@ -10,19 +10,23 @@ from torch.distributed import P2POp
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
-from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
+from vllm.distributed.elastic_ep.elastic_execute import (
+    ElasticEPScalingExecutor,
+    _replace_active_groups,
+)
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
     get_standby_ep_group,
     get_standby_eplb_group,
+    pop_standby_groups,
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
-from vllm.v1.engine import ReconfigureDistributedRequest
+from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
@@ -348,11 +352,84 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             retired_mc2.destroy()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
-        retired_groups = super().switch_and_prepare()
+        # Forked from upstream ``ElasticEPScalingExecutor.switch_and_prepare``
+        # with one Ascend change: registration receives the reconfigured
+        # active load view instead of the maximum-capacity buffer, so
+        # set_layer_state derives the local expert range from the active
+        # slot count across Elastic EP switches.
+        if not self._can_reuse_fused_moe_kernel():
+            self._release_cuda_graphs()
+        retired_groups = _replace_active_groups(**pop_standby_groups())
+
+        parallel_config = self.worker.vllm_config.parallel_config
+        reconfig_request = self.reconfig_request
+        assert reconfig_request is not None
+        new_dp_size = reconfig_request.new_data_parallel_size
+        new_ep_size = get_ep_group().world_size
+
+        parallel_config.data_parallel_size = new_dp_size
+        if reconfig_request.new_data_parallel_rank != ReconfigureRankType.KEEP_CURRENT_RANK:
+            parallel_config.data_parallel_rank = reconfig_request.new_data_parallel_rank
+        if reconfig_request.new_data_parallel_rank_local != ReconfigureRankType.KEEP_CURRENT_RANK:
+            parallel_config.data_parallel_rank_local = reconfig_request.new_data_parallel_rank_local
+        parallel_config.data_parallel_master_ip = reconfig_request.new_data_parallel_master_ip
+        parallel_config.data_parallel_master_port = reconfig_request.new_data_parallel_master_port
+
+        # Reconfigure MoE modules with new EP size
+        moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
+        num_local_experts = moe_modules[0].moe_config.num_local_experts
+        assert all(module.moe_config.num_local_experts == num_local_experts for module in moe_modules), (
+            "All MoE modules must have the same number of local experts"
+        )
+        dp_group = get_dp_group()
+        ep_group = get_ep_group()
+        for module in moe_modules:
+            new_moe_config = self._make_eep_moe_config(module, dp_group, ep_group)
+            module._set_moe_config(new_moe_config)
+
+        # Update EPLB state
+        eplb_state = self.worker.model_runner.eplb_state
+        assert eplb_state is not None
+        model_config = self.worker.model_runner.model_config
+        eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
+
+        num_physical_experts = num_local_experts * new_ep_size
+        num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
+        parallel_config.eplb_config.num_redundant_experts = num_physical_experts - num_logical_experts
+        eplb_state.reconfigure_physical_expert_slots(model_config, num_physical_experts)
+
+        model = self.worker.model_runner.get_model()
+        model.expert_weights = []
+        with set_current_vllm_config(self.worker.vllm_config):
+            model.set_eplb_state(
+                # Ascend: the reconfigured active view, not the capacity
+                # buffer, so the per-layer local expert range derives from
+                # the active slot count.
+                eplb_model_state.expert_load_pass,
+                eplb_model_state.logical_to_physical_map,
+                eplb_model_state.logical_replica_count,
+            )
+            eplb_state._propagate_shared_tensors(model, eplb_model_state.num_unpadded_tokens_tensors)
+            model.update_physical_experts_metadata(
+                num_physical_experts=num_physical_experts,
+                num_local_physical_experts=num_local_experts,
+            )
+            self._commit_staged_moe_quant_methods()
+            get_ep_all2all_manager().commit_ep_size()
+            # Legacy modular methods need to be recreated for the new EP size.
+            for module in moe_modules:
+                if getattr(module._quant_method, "wraps_legacy_quant_method", False):
+                    module._replace_quant_method(module._quant_method.old_quant_method)
+
+        assert self._prepared_eplb_communicator is not None
+        eplb_state.update_communicator(model_config, self._prepared_eplb_communicator)
+        self._prepared_eplb_communicator = None
+
+        # Ascend: swap the MC2 standby group in and refresh the MoE
+        # communication methods against the switched groups.
         retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
         self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
         self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
-        moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()

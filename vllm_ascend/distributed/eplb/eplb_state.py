@@ -4,7 +4,9 @@
 """Ascend-owned extensions for the upstream EPLB state."""
 
 import inspect
+import socket
 import time
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -17,7 +19,6 @@ from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group, get_eplb_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm.distributed.eplb.policy import AbstractEplbPolicy
-from vllm.distributed.parallel_state import in_the_same_node_as
 
 from vllm_ascend.distributed.eplb.policy import PreparedLoadStats
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
@@ -70,7 +71,11 @@ class AscendEplbLayerState(_eplb_state.EplbLayerState):
         ep_group = get_ep_group()
         num_physical_experts = expert_load_view.shape[-1]
         if num_physical_experts % ep_group.world_size:
-            raise ValueError("The number of physical experts must be divisible by EP size")
+            raise ValueError(
+                f"The number of physical experts ({num_physical_experts}, "
+                f"view width {expert_load_view.shape}) must be divisible by the "
+                f"EP size ({ep_group.world_size}, rank {ep_group.rank_in_group})"
+            )
         self.local_expert_count = num_physical_experts // ep_group.world_size
         self.local_expert_start = ep_group.rank_in_group * self.local_expert_count
 
@@ -204,19 +209,16 @@ class AscendEplbState(_eplb_state.EplbState):
 
         cpu_group = get_eplb_group().cpu_group
         num_ranks = cpu_group.size()
-        rank_node_ids = np.full(num_ranks, -1, dtype=np.int64)
-        next_node_id = 0
-        for source_rank in range(num_ranks):
-            if rank_node_ids[source_rank] >= 0:
-                continue
-            same_node = np.asarray(
-                in_the_same_node_as(cpu_group, source_rank),
-                dtype=bool,
-            )
-            if same_node.shape != (num_ranks,) or not same_node[source_rank]:
-                raise RuntimeError("EPLB node discovery returned an invalid rank mask")
-            rank_node_ids[same_node] = next_node_id
-            next_node_id += 1
+        # Gather host identifiers with a plain tensor collective: the
+        # upstream shared-memory probe (/dev/shm visibility + object
+        # broadcast) fails symmetrically across containers and stateless
+        # groups, producing an all-zero rank mask.
+        node_key = zlib.crc32(socket.gethostname().encode())
+        keys = torch.zeros(num_ranks, dtype=torch.int64)
+        keys[torch.distributed.get_rank(group=cpu_group)] = node_key
+        torch.distributed.all_reduce(keys, group=cpu_group)
+        ordinals = {key: ordinal for ordinal, key in enumerate(sorted(set(keys.tolist())))}
+        rank_node_ids = np.array([ordinals[key] for key in keys.tolist()], dtype=np.int64)
         self._rank_node_ids = rank_node_ids
         return rank_node_ids
 
@@ -301,9 +303,10 @@ class AscendEplbState(_eplb_state.EplbState):
         if prepare_load_stats is None:
             raise TypeError("The selected EPLB policy does not prepare load statistics")
         self._discard_samples_from_old_mapping()
-        if self._num_recorded_load_steps == 0:
-            return None
-
+        # No early return for zero local recorded steps: the rank-counts
+        # all_reduce below is the participation barrier, and a freshly
+        # booted Elastic EP scale-up worker has recorded nothing while the
+        # surviving ranks did — skipping it would deadlock them.
         group = get_eplb_group()
         step_indices = self._ordered_load_step_indices()
         rank_counts = self._local_load_collection_mask[step_indices].clone()
