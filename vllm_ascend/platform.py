@@ -1075,6 +1075,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 )
                 upstream_eplb_config.use_async = True
             upstream_eplb_config.communicator = "torch_gloo"
+            # Clear the hixl auto-selection marker: otherwise the worker-init
+            # consensus re-selects hixl over this torch_gloo normalization,
+            # and HIXL register mem fails on the standby EPLB communicator
+            # created during elastic EP scale-down (status 103900).
+            upstream_eplb_config.__dict__.pop("_vllm_ascend_eplb_auto_selected", None)
     elif {"load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
             "stair_config and load_collection_phase are only supported by Model Runner V2; "
