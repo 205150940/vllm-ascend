@@ -20,6 +20,7 @@ from vllm.distributed import get_ep_group, get_eplb_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm.distributed.eplb.policy import AbstractEplbPolicy
 
+from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator
 from vllm_ascend.distributed.eplb.policy import PreparedLoadStats
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
@@ -391,6 +392,26 @@ class AscendEplbState(_eplb_state.EplbState):
         )
         all_reduce(flag, group=device_group)
         return bool(flag.item())
+
+    def create_communicator(self, model_config: Any, group_coordinator: Any) -> Any:
+        communicator = super().create_communicator(model_config, group_coordinator)
+        if isinstance(communicator, AscendHixlEplbCommunicator):
+            # Elastic EP rebuilds the expert weights at the switch; the HIXL
+            # communicator resolves them lazily at first transfer instead of
+            # caching the registration-time lists.
+            model_state = self.model_states[model_config.compute_hash()]
+            communicator.bind_weights_provider(model_state)
+        return communicator
+
+    def update_communicator(self, model_config: Any, communicator: Any) -> None:
+        model_state = self.model_states[model_config.compute_hash()]
+        retired = model_state.communicator
+        if isinstance(retired, AscendHixlEplbCommunicator) and retired is not communicator:
+            # Release the retired engine's registrations before the new one
+            # registers the same segments: HIXL rejects in-process overlap
+            # (register_mem status 103900).
+            retired._close()
+        super().update_communicator(model_config, communicator)
 
     def rearrange(
         self,

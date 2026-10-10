@@ -40,6 +40,7 @@ from vllm_ascend.distributed.elastic_ep.standby_state import (
     create_ascend_standby_groups,
     pop_ascend_standby_groups,
 )
+from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator
 from vllm_ascend.distributed.parallel_state import (
     GroupCoordinator,
     _replace_ascend_active_groups,
@@ -441,6 +442,44 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             # executor's async cleanup thread destroys it after the switch.
             return (*retired_groups, retired_mc2)
         return retired_groups
+
+    def _close_hixl_communicator(self) -> None:
+        """Deregister the active HIXL segments before EEP frees memory.
+
+        HIXL register_mem pins the NPU segments at the driver level: while
+        the registration is alive, releasing those segments (the switch
+        rebuilds the expert weights and empties the cache) fails with
+        AclrtUnmapMem Resource_Busy. The reshuffle is the retired
+        communicator's last use, so deregister right after it.
+        """
+        eplb_state = self.worker.model_runner.eplb_state
+        if eplb_state is None:
+            return
+        model_state = eplb_state.model_states.get(self.worker.model_runner.model_config.compute_hash())
+        if model_state is None:
+            return
+        retired = model_state.communicator
+        if isinstance(retired, AscendHixlEplbCommunicator):
+            retired._close()
+
+    def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
+        self.perform_scale_down_eplb_reshuffle(new_dp_size)
+        self._close_hixl_communicator()
+        if removing:
+            self.switch_and_remove()
+        else:
+            retired_groups = self.switch_and_prepare()
+            if not self._can_reuse_fused_moe_kernel():
+                self.warm_and_capture()
+            elif current_platform.is_rocm():
+                self._warm_target_groups(get_dp_group(), get_ep_group())
+            self._start_group_cleanup(retired_groups)
+
+    def commit_scale_up(self, is_existing_worker: bool) -> None:
+        # The retired communicator is idle across the commit; deregister its
+        # HIXL segments before the switch frees the registered weights.
+        self._close_hixl_communicator()
+        super().commit_scale_up(is_existing_worker)
 
     def receive_expert_mapping(self) -> torch.Tensor:
         mapping = super().receive_expert_mapping()

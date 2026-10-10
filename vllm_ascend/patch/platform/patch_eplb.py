@@ -217,6 +217,17 @@ def resolve_ascend_eplb_communicator(parallel_config, ascend_eplb_config) -> Any
     auto_selected = bool(getattr(eplb_config, _AUTO_SELECTED_ATTRIBUTE, False))
     if eplb_config.communicator is not None and not auto_selected:
         return ascend_eplb_config.stair_config
+    if parallel_config.enable_elastic_ep:
+        # The consensus is a group-wide collective over the eplb group: a
+        # freshly launched Elastic EP worker runs it while the surviving
+        # ranks are long past their one-time init and never join, which
+        # deadlocks the joiner. Under Elastic EP trust the local probe —
+        # every rank of a deployment resolves the same binding on the same
+        # CANN install; a divergent binding surfaces at transfer time.
+        _clear_auto_selected(eplb_config)
+        if eplb_config.communicator is None:
+            eplb_config.communicator = "torch_gloo"
+        return ascend_eplb_config.stair_config
     _clear_auto_selected(eplb_config)
     binding = _group_hixl_binding_consensus()
     if binding in ("official", "ctypes"):

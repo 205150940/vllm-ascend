@@ -5,7 +5,7 @@
 
 import contextlib
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -157,15 +157,13 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[Any]],
         expert_buffer: Sequence[Any],
+        weights_provider: Callable[[], tuple[Sequence[Sequence[Any]], Sequence[Any]]] | None = None,
     ) -> None:
-        self._hixl = _resolve_hixl_module()
-
         if not all_expert_weights or not all_expert_weights[0] or not expert_buffer:
             raise ValueError("HIXL EPLB requires expert weights and receive buffers")
 
         first_view = all_expert_weights[0][0]
-        first_tensors = self._storage_tensors(first_view)
-        first_tensor = first_tensors[0]
+        first_tensor = self._storage_tensors(first_view)[0]
         if first_tensor.device.type != "npu" or first_tensor.ndim == 0 or first_tensor.shape[0] == 0:
             raise ValueError("HIXL EPLB requires non-empty NPU expert tensors")
 
@@ -173,8 +171,12 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._rank = cpu_group.rank()
         self._world_size = cpu_group.size()
         self._device = first_tensor.device
-        self._num_local_experts = first_tensor.shape[0] if len(first_tensors) == 1 else len(first_tensors)
+        self._all_expert_weights = all_expert_weights
+        self._expert_buffer = expert_buffer
+        self._weights_provider = weights_provider
+        self._hixl: Any | None = None
         self._engine: Any | None = None
+        self._num_local_experts = 0
         self._registered_handles: list[int] = []
         self._remote_engines: dict[int, str] = {}
         self._remote_send_meta: dict[int, dict[tuple[int, int], tuple[tuple[int, ...], int]]] = {}
@@ -182,10 +184,38 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._layer_idx: int | None = None
         self._pending_reads: dict[int, list[tuple[int, int, int]]] = {}
         self._pending_bytes = 0
+        self._initialized = False
 
+    def bind_weights_provider(self, model_state: Any) -> None:
+        """Resolve weights at lazy init: Elastic EP rebuilds them at the switch."""
+        self._weights_provider = lambda: (model_state.model.expert_weights, model_state.expert_buffer)
+
+    def _ensure_initialized(self) -> None:
+        """Initialize on first transfer, not at construction.
+
+        Construction happens during Elastic EP preparation, when the active
+        engine still holds registrations over the same segments (register_mem
+        rejects the overlap with status 103900) and the final layout is not
+        known yet. By the first transfer the groups have switched and the
+        weights have been rebuilt, so registering and exchanging metadata
+        here is both legal and current.
+        """
+        if self._initialized:
+            return
+        self._hixl = _resolve_hixl_module()
+        all_expert_weights, expert_buffer = self._transfer_weights_and_buffer()
+        first_view = all_expert_weights[0][0]
+        first_tensors = self._storage_tensors(first_view)
+        self._num_local_experts = first_tensors[0].shape[0] if len(first_tensors) == 1 else len(first_tensors)
         self._validate_tensors(all_expert_weights, expert_buffer)
         self._initialize(all_expert_weights, expert_buffer)
+        self._initialized = True
         self._log_initialized()
+
+    def _transfer_weights_and_buffer(self) -> tuple[Sequence[Sequence[Any]], Sequence[Any]]:
+        if self._weights_provider is not None:
+            return self._weights_provider()
+        return self._all_expert_weights, self._expert_buffer
 
     def _validate_tensors(
         self,
@@ -368,6 +398,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         torch.npu.set_device(self._device)
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+        self._ensure_initialized()
         if self._pending_reads:
             raise RuntimeError("HIXL EPLB started a layer with pending transfers")
         placement = np.asarray(old_indices).reshape(
