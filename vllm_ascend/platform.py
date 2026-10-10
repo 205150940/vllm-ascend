@@ -1085,6 +1085,7 @@ def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
         cache_config.cache_dtype,
     )
 
+
 def _normalize_sleep_backend(model_config) -> None:
     if not model_config.enable_sleep_mode:
         return
@@ -1392,6 +1393,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             )
             upstream_eplb_config.use_async = True
         upstream_eplb_config.communicator = "torch_gloo"
+        # Clear the hixl auto-selection marker: otherwise the worker-init
+        # consensus re-selects hixl over this torch_gloo normalization,
+        # and HIXL register mem fails on the standby EPLB communicator
+        # created during elastic EP scale-down (status 103900).
+        upstream_eplb_config.__dict__.pop("_vllm_ascend_eplb_auto_selected", None)
 
 
 def _validate_direct_reload_config(vllm_config: VllmConfig, ascend_config: AscendConfig) -> None:

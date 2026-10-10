@@ -28,17 +28,14 @@ from vllm_ascend.distributed.device_communicators.int8_all_reduce import (
     QuantizedAllReduce,
 )
 from vllm_ascend.distributed.device_communicators.mxfp8_all_reduce import Mxfp8AllReduce
-
 from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
+
 
 def _accelerator_synchronize() -> None:
     # torch.accelerator APIs raise on CPU-only builds; the mask manager is
     # unit-testable without a device, so guard the synchronize.
     if torch.accelerator.is_available():
         torch.accelerator.synchronize()
-
-
-logger = init_logger(__name__)
 
 
 class _NpuAll2AllManager:

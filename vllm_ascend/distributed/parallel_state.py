@@ -2,7 +2,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.distributed import get_cached_tcp_store_client, parallel_state as vllm_parallel_state
+from vllm.distributed import get_cached_tcp_store_client
+from vllm.distributed import parallel_state as vllm_parallel_state
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _init_stateless_group,

@@ -52,8 +52,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
-from vllm.distributed.parallel_state import get_world_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
 from vllm.logger import logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -331,9 +330,6 @@ class NPUWorker(GPUWorker):
 
     def start_draft_weight_update(self) -> None:
         raise NotImplementedError("GPUWorker.start_draft_weight_update is not validated on Ascend.")
-
-    def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
-        raise NotImplementedError("GPUWorker.elastic_ep_execute is not validated on Ascend.")
 
     def uninstall_static_kernel(self):
         import fcntl
