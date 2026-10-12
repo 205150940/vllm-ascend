@@ -205,10 +205,12 @@ class AscendEplbState(_eplb_state.EplbState):
     def get_rank_node_ids(self) -> np.ndarray:
         """Return cached node ordinals in stage-local EPLB rank order."""
         rank_node_ids = getattr(self, "_rank_node_ids", None)
-        if rank_node_ids is not None:
-            return rank_node_ids
-
         cpu_group = get_eplb_group().cpu_group
+        if rank_node_ids is not None and len(rank_node_ids) == cpu_group.size():
+            # Elastic EP group switches change the member count, so a cache
+            # built over a retired group fails this size check and is
+            # re-discovered against the active group.
+            return rank_node_ids
         num_ranks = cpu_group.size()
         # Gather host identifiers with a plain tensor collective: the
         # upstream shared-memory probe (/dev/shm visibility + object
