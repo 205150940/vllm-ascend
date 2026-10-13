@@ -1423,8 +1423,8 @@ class NPUWorker(WorkerBase):
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.parallel_config.enable_elastic_ep:
             # Only the stateless EPLB group's torch PGs are consumed through
-            # torch.distributed module-level APIs (the gloo staged EPLB
-            # communicator and the dynamic-EPLB P2P transfer pass global
+            # torch.distributed module-level APIs (the HIXL EPLB session's
+            # collectives and the dynamic-EPLB P2P transfer pass global
             # ranks); world/dp/ep groups talk through coordinator methods
             # (PyHccl / TCP store) and never consult ``_world``. Retired
             # groups are unregistered in
