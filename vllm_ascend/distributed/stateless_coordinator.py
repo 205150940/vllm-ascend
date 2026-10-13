@@ -6,9 +6,10 @@ Upstream ``stateless_init_torch_distributed_process_group`` creates
 process groups that are deliberately not registered in torch's global
 ``_world`` state, so ``torch.distributed`` module-level APIs cannot
 resolve them. Ascend needs this for the stateless EPLB group's CPU
-(gloo) process group, which is consumed by the gloo staged EPLB
-communicator (``dist.get_global_rank`` + ``batch_isend_irecv``) and by
-the dynamic-EPLB P2P transfer (global ranks) during elastic EP.
+(gloo) process group, whose torch collectives are invoked through
+module-level APIs by the HIXL EPLB session (``all_gather_object`` /
+``all_reduce``) and by the dynamic-EPLB P2P transfer (global ranks)
+during elastic EP.
 
 Only the CPU (gloo) group is registered. The world/dp/ep groups talk
 through coordinator methods (PyHccl / TCP store) and never consult

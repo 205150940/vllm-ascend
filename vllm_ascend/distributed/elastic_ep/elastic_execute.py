@@ -177,8 +177,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         new_world_size_across_dp: int,
     ) -> None:
         # The standby EPLB group is the only stateless group whose torch PGs
-        # are consumed through torch.distributed module-level APIs (the gloo
-        # staged EPLB communicator and the dynamic-EPLB P2P transfer pass
+        # are consumed through torch.distributed module-level APIs (the HIXL
+        # EPLB session's collectives and the dynamic-EPLB P2P transfer pass
         # global ranks); register it so those calls resolve the group. Paired
         # with unregistration in _destroy_retired_groups.
         standby_eplb_group = get_standby_eplb_group()

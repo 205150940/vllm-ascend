@@ -211,19 +211,27 @@ def resolve_ascend_eplb_communicator(parallel_config, ascend_eplb_config) -> Any
     it group-wide because HIXL engines only interoperate over one CANN line
     protocol and the transfer path must agree on every rank. An explicit
     ``communicator`` setting (no marker) skips the consensus entirely.
-    Falls back to torch_gloo — clamping the STAIR transfer limits the user
+
+    Elastic EP skips the consensus (its all_reduce hangs scale-up) and is
+    pinned to hixl; torch_gloo is unsupported for elastic EP. Otherwise this
+    falls back to torch_gloo — clamping the STAIR transfer limits the user
     left unset — when any rank lacks a usable HIXL binding or when the
     binding classes differ between ranks.
     """
     eplb_config = parallel_config.eplb_config
     auto_selected = bool(getattr(eplb_config, _AUTO_SELECTED_ATTRIBUTE, False))
-    if eplb_config.communicator is not None and not auto_selected:
-        return ascend_eplb_config.stair_config
     if parallel_config.enable_elastic_ep:
-        # The consensus all_reduce hangs Elastic EP scale-up
+        # The consensus all_reduce hangs Elastic EP scale-up, so skip it and
+        # pin the communicator to hixl; torch_gloo is unsupported for EEP.
         _clear_auto_selected(eplb_config)
-        if eplb_config.communicator is None:
-            eplb_config.communicator = "torch_gloo"
+        if eplb_config.communicator != "hixl":
+            logger.info(
+                "Ascend EPLB selected hixl for elastic EP (overriding %s).",
+                eplb_config.communicator,
+            )
+            eplb_config.communicator = "hixl"
+        return ascend_eplb_config.stair_config
+    if eplb_config.communicator is not None and not auto_selected:
         return ascend_eplb_config.stair_config
     _clear_auto_selected(eplb_config)
     binding = _group_hixl_binding_consensus()
