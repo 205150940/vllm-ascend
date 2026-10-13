@@ -256,7 +256,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
     ) -> tuple[GroupCoordinator | None, ...]:
         # Swap the MC2 standby group in and refresh the MoE communication
         # methods against the switched groups.
-        retired_mc2 = _replace_ascend_active_groups(**pop_ascend_standby_groups())
+        retired_mc2 = _replace_ascend_active_groups(mc2=pop_ascend_standby_groups())
         self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
         self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
         for module in moe_modules:
