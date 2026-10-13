@@ -465,12 +465,14 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[Any]],
         expert_buffer: Sequence[Any],
+        weights_provider: Callable[[], tuple[Sequence[Sequence[Any]], Sequence[Any]]] | None = None,
     ) -> None:
         self._cpu_group = cpu_group
         self._rank = cpu_group.rank()
         self._world_size = cpu_group.size()
         self._all_expert_weights = all_expert_weights
         self._expert_buffer = expert_buffer
+        self._weights_provider = weights_provider
         self._session: _HixlSession | None = None
         self._remote_send_meta: dict[int, _ExpertMetadata] = {}
         self._expert_to_src_row: list[dict[int, int]] | None = None
@@ -479,6 +481,10 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._pending_bytes = 0
 
     def _prepare(self) -> None:
+        if self._weights_provider is not None:
+            # Resolve weights at session init: Elastic EP rebuilds them at
+            # the group switch, so the construction-time lists are stale.
+            self._all_expert_weights, self._expert_buffer = self._weights_provider()
         if not self._all_expert_weights or not self._all_expert_weights[0] or not self._expert_buffer:
             raise ValueError("HIXL EPLB requires expert weights and receive buffers")
         first_view = self._all_expert_weights[0][0]
@@ -498,6 +504,26 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._session.check_usable()
         return self._session
 
+    def bind_weights_provider(self, model_state: Any) -> None:
+        """Resolve weights at lazy init: Elastic EP rebuilds them at the switch."""
+        self._weights_provider = lambda: (model_state.model.expert_weights, model_state.expert_buffer)
+
+    def _ensure_initialized(self) -> None:
+        """Initialize on first transfer, not at construction.
+
+        Construction happens during Elastic EP preparation, when the active
+        engine still holds registrations over the same segments (register_mem
+        rejects the overlap with status 103900) and the final layout is not
+        known yet. By the first transfer the groups have switched and the
+        weights have been rebuilt, so registering and exchanging metadata
+        here is both legal and current.
+        """
+        if self._session is not None:
+            self._session.check_usable()
+            return
+        session = _HixlSession(self._cpu_group)
+        self._session = session
+        session.initialize({"": self})
     def _validate_tensors(
         self,
         all_expert_weights: Sequence[Sequence[Any]],
@@ -554,11 +580,17 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         return local_meta
 
     def set_stream(self, stream: torch.Stream | None) -> None:
+        session = self._session
+        if session is None:
+            # HIXL owns its transfer streams; before lazy initialization
+            # there is no engine context to restore.
+            return
         # HIXL owns its streams; restore the engine's initialization context.
-        self._require_session()._set_hixl_context()
+        session.check_usable()
+        session._set_hixl_context()
 
     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
-        self._require_session()
+        self._ensure_initialized()
         if self._pending_reads:
             raise RuntimeError("HIXL EPLB started a layer with pending transfers")
         placement = np.asarray(old_indices).reshape(
@@ -643,3 +675,16 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         return False
+
+    def _close(self) -> None:
+        """Release the session registrations (Elastic EP retirement path).
+
+        HIXL register_mem pins the NPU segments at the driver level: the
+        retired communicator's registrations must be released before the
+        switch frees the registered weights and the replacement registers
+        the same segments.
+        """
+        if self._session is None:
+            return
+        session, self._session = self._session, None
+        session.close()

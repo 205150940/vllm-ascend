@@ -4,8 +4,10 @@
 """Ascend-owned extensions for the upstream EPLB state."""
 
 import inspect
+import socket
 import threading
 import time
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -137,7 +139,8 @@ def _raise_if_async_worker_stopped(state: Any) -> None:
     worker = getattr(state, "async_worker", None)
     if worker is not None and not worker.is_alive():
         error = RuntimeError("EPLB background worker terminated unexpectedly")
-        session = getattr(state, "_hixl_session", None)
+        session_getter = getattr(state, "_current_hixl_session", None)
+        session = session_getter() if session_getter is not None else getattr(state, "_hixl_session", None)
         if session is not None:
             # Device/stream setup can fail before the migration loop is entered.
             session._error = session._error or error
@@ -184,9 +187,24 @@ class AscendEplbState(_eplb_state.EplbState):
         """Whether the selected policy transforms temporal load samples."""
         return callable(getattr(getattr(self, "policy", None), "prepare_local_load_stats", None))
 
+    def _current_hixl_session(self) -> _HixlSession | None:
+        """Return the active HIXL session.
+
+        It is either the one initialized eagerly with the initial models or
+        the one a lazily initialized (Elastic EP standby) communicator
+        created on its first transfer.
+        """
+        if self._hixl_session is not None:
+            return self._hixl_session
+        for model_state in self.model_states.values():
+            communicator = getattr(model_state, "communicator", None)
+            if isinstance(communicator, AscendHixlEplbCommunicator) and communicator._session is not None:
+                return communicator._session
+        return None
+
     def add_model(self, model, model_config) -> None:
         """Build the EP-aware layout and initialize custom load statistics."""
-        if self._hixl_session is not None:
+        if self._current_hixl_session() is not None:
             raise RuntimeError("Cannot add EPLB models after HIXL initialization")
         token = EXPERT_MAPPING_EP_SIZE.set(get_ep_group().world_size)
         try:
@@ -224,15 +242,17 @@ class AscendEplbState(_eplb_state.EplbState):
                 if worker.is_alive():
                     raise TimeoutError("EPLB background worker could not be stopped; worker must terminate")
                 self.async_worker = None
-            if self._hixl_session is not None:
-                self._hixl_session.close()
+            session = self._current_hixl_session()
+            if session is not None:
+                session.close()
         except Exception as error:
             self._close_error = error
             self.raise_if_close_failed()
 
     def raise_if_close_failed(self) -> None:
-        if self._hixl_session is not None and self._hixl_session._error is not None:
-            self._close_error = self._hixl_session._error
+        session = self._current_hixl_session()
+        if session is not None and session._error is not None:
+            self._close_error = session._error
         if self._close_error is not None:
             logger.error("EPLB cleanup failed; terminating the worker: %s", self._close_error)
             # Ordinary RPC exceptions are caught by the upstream worker loop.
@@ -248,11 +268,12 @@ class AscendEplbState(_eplb_state.EplbState):
                 for key, model_state in self.model_states.items()
                 if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
             }
-            if communicators and self._hixl_session is None:
+            if communicators and self._current_hixl_session() is None:
                 self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
                 self._hixl_session.initialize(communicators)
-            if self._hixl_session is not None:
-                self._hixl_session.check_usable()
+            session = self._current_hixl_session()
+            if session is not None:
+                session.check_usable()
             super().start_async_loop(*args, **kwargs)
 
     def _initialize_load_stats_state(self, model_state: Any) -> None:
@@ -282,24 +303,23 @@ class AscendEplbState(_eplb_state.EplbState):
     def get_rank_node_ids(self) -> np.ndarray:
         """Return cached node ordinals in stage-local EPLB rank order."""
         rank_node_ids = getattr(self, "_rank_node_ids", None)
-        if rank_node_ids is not None:
-            return rank_node_ids
-
         cpu_group = get_eplb_group().cpu_group
+        if rank_node_ids is not None and len(rank_node_ids) == cpu_group.size():
+            # Elastic EP group switches change the member count, so a cache
+            # built over a retired group fails this size check and is
+            # re-discovered against the active group.
+            return rank_node_ids
         num_ranks = cpu_group.size()
-        rank_node_ids = np.full(num_ranks, -1, dtype=np.int64)
-        next_node_id = 0
-        for source_rank in range(num_ranks):
-            if rank_node_ids[source_rank] >= 0:
-                continue
-            same_node = np.asarray(
-                in_the_same_node_as(cpu_group, source_rank),
-                dtype=bool,
-            )
-            if same_node.shape != (num_ranks,) or not same_node[source_rank]:
-                raise RuntimeError("EPLB node discovery returned an invalid rank mask")
-            rank_node_ids[same_node] = next_node_id
-            next_node_id += 1
+        # Gather host identifiers with a plain tensor collective: the
+        # upstream shared-memory probe (/dev/shm visibility + object
+        # broadcast) fails symmetrically across containers and stateless
+        # groups, producing an all-zero rank mask.
+        node_key = zlib.crc32(socket.gethostname().encode())
+        keys = torch.zeros(num_ranks, dtype=torch.int64)
+        keys[torch.distributed.get_rank(group=cpu_group)] = node_key
+        torch.distributed.all_reduce(keys, group=cpu_group)
+        ordinals = {key: ordinal for ordinal, key in enumerate(sorted(set(keys.tolist())))}
+        rank_node_ids = np.array([ordinals[key] for key in keys.tolist()], dtype=np.int64)
         self._rank_node_ids = rank_node_ids
         return rank_node_ids
 
@@ -353,7 +373,7 @@ class AscendEplbState(_eplb_state.EplbState):
     ) -> None:
         """Advance the custom time axis alongside the upstream load window."""
         self.raise_if_close_failed()
-        if self._hixl_session is not None:
+        if self._current_hixl_session() is not None:
             _raise_if_async_worker_stopped(self)
         is_sampling = getattr(self, "_is_load_sampling_step", False) and not is_dummy and not is_profile
         should_collect = getattr(self, "_should_collect_local_load", False)
@@ -387,9 +407,10 @@ class AscendEplbState(_eplb_state.EplbState):
         if prepare_load_stats is None:
             raise TypeError("The selected EPLB policy does not prepare load statistics")
         self._discard_samples_from_old_mapping()
-        if self._num_recorded_load_steps == 0:
-            return None
-
+        # No early return for zero local recorded steps: the rank-counts
+        # all_reduce below is the participation barrier, and a freshly
+        # booted Elastic EP scale-up worker has recorded nothing while the
+        # surviving ranks did — skipping it would deadlock them.
         group = get_eplb_group()
         step_indices = self._ordered_load_step_indices()
         rank_counts = self._local_load_collection_mask[step_indices].clone()
@@ -474,6 +495,29 @@ class AscendEplbState(_eplb_state.EplbState):
         )
         all_reduce(flag, group=device_group)
         return bool(flag.item())
+
+    def create_communicator(self, model_config: Any, group_coordinator: Any) -> Any:
+        communicator = super().create_communicator(model_config, group_coordinator)
+        if isinstance(communicator, AscendHixlEplbCommunicator):
+            # Elastic EP rebuilds the expert weights at the switch; the HIXL
+            # communicator resolves them lazily at first transfer instead of
+            # caching the registration-time lists.
+            model_state = self.model_states[model_config.compute_hash()]
+            communicator.bind_weights_provider(model_state)
+        return communicator
+
+    def update_communicator(self, model_config: Any, communicator: Any) -> None:
+        model_state = self.model_states[model_config.compute_hash()]
+        retired = model_state.communicator
+        if isinstance(retired, AscendHixlEplbCommunicator) and retired is not communicator:
+            # Release the retired engine's registrations before the new one
+            # registers the same segments: HIXL rejects in-process overlap
+            # (register_mem status 103900).
+            session = retired._session
+            retired._close()
+            if self._hixl_session is session:
+                self._hixl_session = None
+        super().update_communicator(model_config, communicator)
 
     def rearrange(
         self,
