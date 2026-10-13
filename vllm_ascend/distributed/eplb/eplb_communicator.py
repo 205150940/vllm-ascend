@@ -5,6 +5,7 @@
 
 import contextlib
 import time
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -484,6 +485,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._expert_buffer = expert_buffer
         self._stream: torch.Stream | None = None
         self._weights_provider = weights_provider
+        self._session_owner: weakref.ref | None = None
         self._session: _HixlSession | None = None
         self._remote_send_meta: dict[int, _ExpertMetadata] = {}
         self._expert_to_src_row: list[dict[int, int]] | None = None
@@ -519,6 +521,12 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         """Resolve weights at lazy init: Elastic EP rebuilds them at the switch."""
         self._weights_provider = lambda: (model_state.model.expert_weights, model_state.expert_buffer)
 
+    def bind_session_owner(self, owner: Any) -> None:
+        """Keep the owning EPLB state weak so the session created on the first
+        transfer is registered back on it, mirroring the eager session that
+        ``start_async_loop`` installs on the state."""
+        self._session_owner = weakref.ref(owner)
+
     def _ensure_initialized(self) -> None:
         """Initialize on first transfer, not at construction.
 
@@ -535,6 +543,10 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         session = _HixlSession(self._cpu_group)
         self._session = session
         session.initialize({"": self})
+        owner = self._session_owner() if self._session_owner is not None else None
+        if owner is not None:
+            owner._hixl_session = session
+
     def _validate_tensors(
         self,
         all_expert_weights: Sequence[Sequence[Any]],
