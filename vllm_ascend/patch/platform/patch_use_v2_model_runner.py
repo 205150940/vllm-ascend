@@ -31,6 +31,21 @@ def _patched_use_v2_model_runner(self) -> bool:
 VllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 
+# Upstream EEP (elastic expert parallelism) does not support the V2 model
+# runner, so it is listed as unsupported; Ascend's V2 runner supports
+# elastic EP, so drop that entry here.
+_original_get_v2_model_runner_unsupported_features = VllmConfig._get_v2_model_runner_unsupported_features
+
+
+def _patched_get_v2_model_runner_unsupported_features(self) -> list[str]:
+    unsupported = _original_get_v2_model_runner_unsupported_features(self)
+    unsupported = [f for f in unsupported if f != "elastic expert parallelism"]
+    return unsupported
+
+
+VllmConfig._get_v2_model_runner_unsupported_features = _patched_get_v2_model_runner_unsupported_features
+
+
 def _patched_validate_v2_model_runner(self) -> None:
     if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):
         return

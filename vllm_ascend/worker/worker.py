@@ -31,7 +31,12 @@ import torch_npu
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
+from vllm.distributed import (
+    ensure_model_parallel_initialized,
+    get_eplb_group,
+    get_pcp_group,
+    init_distributed_environment,
+)
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -41,6 +46,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
+from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
@@ -96,6 +102,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     plan_sparse_kv_offload_memory,
 )
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.distributed.stateless_coordinator import (
+    register_stateless_coordinator_pgs,
+)
 from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_idle_step
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -382,6 +391,11 @@ class NPUWorker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+
+        # Wait for the Elastic EP async group-cleanup thread before the
+        # worker (and its device context) goes away.
+        if elastic_ep_executor := getattr(self, "elastic_ep_executor", None):
+            elastic_ep_executor.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
@@ -1327,6 +1341,17 @@ class NPUWorker(WorkerBase):
             )
         init_ascend_model_parallel(self.parallel_config, self.vllm_config.engram_config)
         ensure_ec_transfer_initialized(self.vllm_config)
+        if self.parallel_config.enable_elastic_ep:
+            # Only the stateless EPLB group's torch PGs are consumed through
+            # torch.distributed module-level APIs (the gloo staged EPLB
+            # communicator and the dynamic-EPLB P2P transfer pass global
+            # ranks); world/dp/ep groups talk through coordinator methods
+            # (PyHccl / TCP store) and never consult ``_world``. Retired
+            # groups are unregistered in
+            # AscendElasticEPScalingExecutor._destroy_retired_groups.
+            eplb_group = get_eplb_group()
+            if isinstance(eplb_group, StatelessGroupCoordinator):
+                register_stateless_coordinator_pgs(eplb_group)
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()
@@ -1369,6 +1394,9 @@ class NPUWorker(WorkerBase):
         return
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
+        assert self.elastic_ep_executor is not None, (
+            "elastic_ep_execute requires elastic EP to be enabled (--enable-elastic-ep)"
+        )
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
 
