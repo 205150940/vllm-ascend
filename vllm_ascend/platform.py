@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import torch
 import vllm.envs as envs_vllm
-from torch.distributed.distributed_c10d import Backend, BackendConfig, PrefixStore, ProcessGroup, _world
+from torch.distributed.distributed_c10d import Backend, PrefixStore, ProcessGroup
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -745,36 +745,6 @@ class NPUPlatform(Platform):
         pg._set_group_desc("undefined")
 
         return pg
-
-    @classmethod
-    def on_stateless_process_group_created(
-        cls,
-        pg: ProcessGroup,
-        group_ranks: list[int],
-        backend: str,
-    ) -> None:
-        # Register the stateless group in torch's global ``_world``: the
-        # gloo staged EPLB communicator and the MegaMoe symm-buffer
-        # handshake resolve ranks via torch.distributed module-level APIs
-        # (``dist.get_rank(group=...)``), which need the entry. Elastic
-        # group members are not contiguous global ranks, so register the
-        # real {global_rank: group_rank} translation, not an identity map.
-        rank_map = {global_rank: idx for idx, global_rank in enumerate(group_ranks)}
-        _world.pg_group_ranks[pg] = rank_map
-        _world.pg_map[pg] = (backend, pg.get_group_store())
-        _world.pg_names[pg] = pg.group_name
-        _world.pg_backend_config[pg] = str(BackendConfig(backend))
-
-    @classmethod
-    def on_stateless_process_group_destroyed(cls, pg: ProcessGroup) -> None:
-        # Mirror of on_stateless_process_group_created, invoked by
-        # StatelessGroupCoordinator.destroy before the PG shuts down; stale
-        # entries would otherwise keep the PG (and its HCCL/gloo comms)
-        # alive across elastic scaling rounds. Idempotent.
-        _world.pg_map.pop(pg, None)
-        _world.pg_names.pop(pg, None)
-        _world.pg_group_ranks.pop(pg, None)
-        _world.pg_backend_config.pop(pg, None)
 
 
 def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:

@@ -466,7 +466,6 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[Any]],
         expert_buffer: Sequence[Any],
-        weights_provider: Callable[[], tuple[Sequence[Sequence[Any]], Sequence[Any]]] | None = None,
     ) -> None:
         self._cpu_group = cpu_group
         self._rank = cpu_group.rank()
@@ -474,7 +473,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._all_expert_weights = all_expert_weights
         self._expert_buffer = expert_buffer
         self._stream: torch.Stream | None = None
-        self._weights_provider = weights_provider
+        self._weights_provider: Callable[[], tuple[Sequence[Sequence[Any]], Sequence[Any]]] | None = None
         self._session_owner: weakref.ref | None = None
         self._session: _HixlSession | None = None
         self._remote_send_meta: dict[int, _ExpertMetadata] = {}
