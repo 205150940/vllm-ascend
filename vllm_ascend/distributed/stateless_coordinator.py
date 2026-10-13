@@ -24,7 +24,7 @@ misclassified as stateful and take the ``dist.get_rank(group=...)``
 path. Call sites:
 - ``NPUWorker._init_worker_distributed_environment`` for the startup
   EPLB group, and
-- ``AscendElasticEPScalingExecutor.prepare_reconfiguration`` for the
+- ``AscendElasticEPScalingExecutor._create_backend_standby_groups`` for the
   standby EPLB group created on scale-up preparation.
 Unregistration is paired in
 ``AscendElasticEPScalingExecutor._destroy_retired_groups``.

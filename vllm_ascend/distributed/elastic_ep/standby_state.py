@@ -16,14 +16,13 @@ def create_ascend_standby_groups(
     new_world_size_across_dp: int,
     master_ip: str,
     coord_store_port: int,
-    backend: str | None = None,
 ) -> None:
     global _STANDBY_MC2
 
     assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
     world_group = get_world_group()
     assert isinstance(world_group, StatelessGroupCoordinator)
-    backend = backend or world_group.backend
+    backend = world_group.backend
 
     coord_store = get_cached_tcp_store_client(master_ip, coord_store_port)
 
@@ -45,11 +44,9 @@ def create_ascend_standby_groups(
     )
 
 
-def pop_ascend_standby_groups() -> dict:
-    """Return all standby groups and clear the standby state."""
+def pop_ascend_standby_groups() -> StatelessGroupCoordinator | None:
+    """Return the standby MC2 group and clear the standby state."""
     global _STANDBY_MC2
-    result = dict(
-        mc2=_STANDBY_MC2,
-    )
+    result = _STANDBY_MC2
     _STANDBY_MC2 = None
     return result
