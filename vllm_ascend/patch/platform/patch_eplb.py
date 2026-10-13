@@ -24,8 +24,10 @@ from vllm.model_executor.layers.fused_moe import routed_experts as _routed_exper
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 
-from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
-from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator
+from vllm_ascend.distributed.eplb.eplb_communicator import (
+    AscendGlooEplbCommunicator,
+    AscendHixlEplbCommunicator,
+)
 from vllm_ascend.distributed.eplb.eplb_state import (
     ASYNC_EPLB_CYCLE_COMMITTED_LOG,
     EXPERT_MAPPING_EP_SIZE,
@@ -218,12 +220,7 @@ def resolve_ascend_eplb_communicator(parallel_config, ascend_eplb_config) -> Any
     if eplb_config.communicator is not None and not auto_selected:
         return ascend_eplb_config.stair_config
     if parallel_config.enable_elastic_ep:
-        # The consensus is a group-wide collective over the eplb group: a
-        # freshly launched Elastic EP worker runs it while the surviving
-        # ranks are long past their one-time init and never join, which
-        # deadlocks the joiner. Under Elastic EP trust the local probe —
-        # every rank of a deployment resolves the same binding on the same
-        # CANN install; a divergent binding surfaces at transfer time.
+        # The consensus all_reduce hangs Elastic EP scale-up
         _clear_auto_selected(eplb_config)
         if eplb_config.communicator is None:
             eplb_config.communicator = "torch_gloo"

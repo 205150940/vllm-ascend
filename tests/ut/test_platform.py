@@ -458,7 +458,6 @@ class TestNPUPlatform(TestBase):
         with patch.dict("os.environ", {}, clear=True):
             _validate_eplb_config(vllm_config)
 
-
     def test_validate_eplb_config_allows_load_collection_phase_with_dbo_and_spec_decode(
         self,
     ):

@@ -1063,15 +1063,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
-            # vLLM presets "pynccl" (or "nixl"/"hixl" when detected) when
-            # elastic EP is enabled; Ascend uses the torch_gloo CPU-staging
-            # communicator for both regular and elastic EP, so normalize
-            # "pynccl"/"nixl" to "torch_gloo" here.
-            if upstream_eplb_config.communicator not in (None, "torch_gloo", "pynccl", "nixl", "hixl"):
+            if upstream_eplb_config.communicator not in (None, "torch_gloo", "hixl"):
                 raise ValueError(
-                    "Async EPLB on Ascend requires the torch_gloo communicator "
-                    f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
-                    "Set eplb_config.communicator to 'torch_gloo'."
+                    "Async EPLB on Ascend requires the torch_gloo or hixl communicator "
+                    f"but got {upstream_eplb_config.communicator!r}. "
+                    "Set eplb_config.communicator to 'torch_gloo' or 'hixl'."
                 )
             if not upstream_eplb_config.use_async:
                 logger.warning(
@@ -1080,15 +1076,6 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                     "action: forcing asynchronous EPLB."
                 )
                 upstream_eplb_config.use_async = True
-            if upstream_eplb_config.communicator != "hixl":
-                # nixl/pynccl have no Ascend implementation: keep the
-                # torch_gloo normalization for them. hixl passes through —
-                # its communicator initializes lazily at the first transfer
-                # and the retired engine closes at the switch, so Elastic EP
-                # transitions no longer hit the construction-time
-                # registration conflict (register_mem status 103900).
-                upstream_eplb_config.communicator = "torch_gloo"
-                upstream_eplb_config.__dict__.pop("_vllm_ascend_eplb_auto_selected", None)
     elif {"load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
             "stair_config and load_collection_phase are only supported by Model Runner V2; "
