@@ -116,7 +116,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
 
     def destroy(self):
         if self.pyhccl_comm is not None:
-            self.pyhccl_comm.destroy()
+            self.pyhccl_comm.close()
             self.pyhccl_comm = None
 
     def batch_isend_irecv(self, p2p_ops: list):
