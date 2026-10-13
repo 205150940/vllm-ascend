@@ -139,8 +139,7 @@ def _raise_if_async_worker_stopped(state: Any) -> None:
     worker = getattr(state, "async_worker", None)
     if worker is not None and not worker.is_alive():
         error = RuntimeError("EPLB background worker terminated unexpectedly")
-        session_getter = getattr(state, "_current_hixl_session", None)
-        session = session_getter() if session_getter is not None else getattr(state, "_hixl_session", None)
+        session = getattr(state, "_hixl_session", None)
         if session is not None:
             # Device/stream setup can fail before the migration loop is entered.
             session._error = session._error or error
@@ -187,24 +186,9 @@ class AscendEplbState(_eplb_state.EplbState):
         """Whether the selected policy transforms temporal load samples."""
         return callable(getattr(getattr(self, "policy", None), "prepare_local_load_stats", None))
 
-    def _current_hixl_session(self) -> _HixlSession | None:
-        """Return the active HIXL session.
-
-        It is either the one initialized eagerly with the initial models or
-        the one a lazily initialized (Elastic EP standby) communicator
-        created on its first transfer.
-        """
-        if self._hixl_session is not None:
-            return self._hixl_session
-        for model_state in self.model_states.values():
-            communicator = getattr(model_state, "communicator", None)
-            if isinstance(communicator, AscendHixlEplbCommunicator) and communicator._session is not None:
-                return communicator._session
-        return None
-
     def add_model(self, model, model_config) -> None:
         """Build the EP-aware layout and initialize custom load statistics."""
-        if self._current_hixl_session() is not None:
+        if self._hixl_session is not None:
             raise RuntimeError("Cannot add EPLB models after HIXL initialization")
         token = EXPERT_MAPPING_EP_SIZE.set(get_ep_group().world_size)
         try:
@@ -242,17 +226,15 @@ class AscendEplbState(_eplb_state.EplbState):
                 if worker.is_alive():
                     raise TimeoutError("EPLB background worker could not be stopped; worker must terminate")
                 self.async_worker = None
-            session = self._current_hixl_session()
-            if session is not None:
-                session.close()
+            if self._hixl_session is not None:
+                self._hixl_session.close()
         except Exception as error:
             self._close_error = error
             self.raise_if_close_failed()
 
     def raise_if_close_failed(self) -> None:
-        session = self._current_hixl_session()
-        if session is not None and session._error is not None:
-            self._close_error = session._error
+        if self._hixl_session is not None and self._hixl_session._error is not None:
+            self._close_error = self._hixl_session._error
         if self._close_error is not None:
             logger.error("EPLB cleanup failed; terminating the worker: %s", self._close_error)
             # Ordinary RPC exceptions are caught by the upstream worker loop.
@@ -263,17 +245,24 @@ class AscendEplbState(_eplb_state.EplbState):
 
     def start_async_loop(self, *args, **kwargs) -> None:
         if not self._suspended:
-            communicators = {
-                key: model_state.communicator
-                for key, model_state in self.model_states.items()
-                if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
-            }
-            if communicators and self._current_hixl_session() is None:
-                self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
-                self._hixl_session.initialize(communicators)
-            session = self._current_hixl_session()
-            if session is not None:
-                session.check_usable()
+            # Elastic EP rebuilds the HIXL session on every topology switch. The
+            # async worker -- woken by ``rearrange`` before this call -- builds
+            # it lazily on its first transfer, so creating it here too would race
+            # the worker for the same registrations. Only the non-elastic path
+            # owns the session at this point; the elastic path's session is
+            # created by the communicator and kept on the state via
+            # ``bind_session_owner``.
+            if not self.parallel_config.enable_elastic_ep:
+                communicators = {
+                    key: model_state.communicator
+                    for key, model_state in self.model_states.items()
+                    if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
+                }
+                if communicators and self._hixl_session is None:
+                    self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
+                    self._hixl_session.initialize(communicators)
+                if self._hixl_session is not None:
+                    self._hixl_session.check_usable()
             super().start_async_loop(*args, **kwargs)
 
     def _initialize_load_stats_state(self, model_state: Any) -> None:
@@ -373,7 +362,7 @@ class AscendEplbState(_eplb_state.EplbState):
     ) -> None:
         """Advance the custom time axis alongside the upstream load window."""
         self.raise_if_close_failed()
-        if self._current_hixl_session() is not None:
+        if self._hixl_session is not None:
             _raise_if_async_worker_stopped(self)
         is_sampling = getattr(self, "_is_load_sampling_step", False) and not is_dummy and not is_profile
         should_collect = getattr(self, "_should_collect_local_load", False)
@@ -504,6 +493,9 @@ class AscendEplbState(_eplb_state.EplbState):
             # caching the registration-time lists.
             model_state = self.model_states[model_config.compute_hash()]
             communicator.bind_weights_provider(model_state)
+            # The lazily created session is registered back on this state, so
+            # the state stays the single owner of the active HIXL session.
+            communicator.bind_session_owner(self)
         return communicator
 
     def update_communicator(self, model_config: Any, communicator: Any) -> None:
@@ -515,7 +507,11 @@ class AscendEplbState(_eplb_state.EplbState):
             # (register_mem status 103900).
             session = retired._session
             retired._close()
-            if self._hixl_session is session:
+            # The retired session is gone: drop the state's stale reference so
+            # the switched-in communicator rebuilds it, eagerly in
+            # ``start_async_loop`` (scale-up reshuffle) or lazily on its first
+            # transfer (scale-down).
+            if session is None or self._hixl_session is session:
                 self._hixl_session = None
         super().update_communicator(model_config, communicator)
 
