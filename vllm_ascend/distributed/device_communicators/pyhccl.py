@@ -129,13 +129,6 @@ class PyHcclCommunicator:
                 stream.synchronize()
                 del data
 
-    def destroy(self):
-        if self.available and not self.disabled:
-            with torch.accelerator.device_index(self.device.index):
-                self.hccl.hcclCommDestroy(self.comm)
-            self.available = False
-            self.disabled = True
-
     def close(self) -> None:
         """Destroy the native communicator at most once."""
         if not self.available:
