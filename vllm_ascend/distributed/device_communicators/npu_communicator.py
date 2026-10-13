@@ -15,9 +15,6 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import DeviceCommunicatorBase
@@ -42,7 +39,7 @@ class _NpuAll2AllManager:
     def query_active_mask(self) -> torch.Tensor:
         return torch.zeros(1, dtype=torch.bool, device="cpu")
 
-    # Elastic-EP hooks added to All2AllManagerBase upstream. NPU routes MoE
+    # Elastic-EP hooks that upstream calls unconditionally. NPU routes MoE
     # communication through MC2/all_gather and never reuses kernels across EP
     # rank changes, so these are no-ops.
     def stage_ep_size(self) -> None:
@@ -50,10 +47,6 @@ class _NpuAll2AllManager:
 
     def commit_ep_size(self) -> None:
         pass
-
-    @contextmanager
-    def mask_remote_ranks(self) -> Iterator[None]:
-        yield
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
