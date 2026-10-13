@@ -950,6 +950,7 @@ class AscendConfig:
         self.enable_sp_by_pass = vc.model_config is not None and not vc.model_config.enforce_eager and enable_sp_by_pass
 
         self._validate_mc2_comm_alg(vc)
+        self._validate_elastic_ep(vc)
 
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:
@@ -1014,18 +1015,23 @@ class AscendConfig:
 
     def _validate_elastic_ep(self, vllm_config: VllmConfig) -> None:
         parallel_config = vllm_config.parallel_config
-        if parallel_config.enable_elastic_ep:
-            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+        if not parallel_config.enable_elastic_ep:
+            return
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-            if get_ascend_device_type() != AscendDeviceType.A3:
-                raise ValueError("Elastic EP is only supported on A3.")
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            raise ValueError("Elastic EP is only supported on A3.")
 
-            if self.eplb_config.dynamic_eplb:
-                raise RuntimeError(
-                    "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
-                    "Set dynamic_eplb=False in eplb_config to use Elastic EP."
-                    "Or use EPLB in ModelRunnerV2 instead."
-                )
+        if not getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError(
+                "Elastic EP is only supported with Model Runner V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
+            )
+
+        if parallel_config.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "Elastic EP is not supported with prefill context parallelism "
+                f"(prefill_context_parallel_size={parallel_config.prefill_context_parallel_size})."
+            )
 
     def _validate_sparse_packed_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.uses_packed_sfa_main_cache:
