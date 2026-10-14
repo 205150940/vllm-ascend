@@ -33,8 +33,7 @@ def create_ascend_standby_groups(
     group_ranks = all_ranks.unbind(0)
     standby_mc2_ranks = [x.tolist() for x in group_ranks]
 
-    # The standby MC2 group is always stateless: it is only built for elastic
-    # EP scaling, so new ranks must be able to join the topology dynamically.
+    # Always stateless: elastic EP needs dynamic membership.
     _STANDBY_MC2 = _init_stateless_group(
         standby_mc2_ranks,
         "mc2",

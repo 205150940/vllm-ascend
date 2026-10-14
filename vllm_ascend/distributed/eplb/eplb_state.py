@@ -3,6 +3,7 @@
 
 """Ascend-owned extensions for the upstream EPLB state."""
 
+import inspect
 import socket
 import threading
 import time
@@ -44,6 +45,11 @@ def _configured_upstream_policy(name: str, policy: AbstractEplbPolicy | None) ->
         yield
     finally:
         policies.pop(name)
+
+
+def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
+    """Return whether the selected vLLM uses the release mapping contract."""
+    return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -234,13 +240,8 @@ class AscendEplbState(_eplb_state.EplbState):
 
     def start_async_loop(self, *args, **kwargs) -> None:
         if not self._suspended:
-            # Elastic EP rebuilds the HIXL session on every topology switch. The
-            # async worker -- woken by ``rearrange`` before this call -- builds
-            # it lazily on its first transfer, so creating it here too would race
-            # the worker for the same registrations. Only the non-elastic path
-            # owns the session at this point; the elastic path's session is
-            # created by the communicator and kept on the state via
-            # ``bind_session_owner``.
+            # Elastic EP builds the HIXL session lazily on first transfer (owned
+            # via bind_session_owner); only the non-elastic path creates it here.
             if not self.parallel_config.enable_elastic_ep:
                 communicators = {
                     key: model_state.communicator
@@ -283,15 +284,12 @@ class AscendEplbState(_eplb_state.EplbState):
         rank_node_ids = getattr(self, "_rank_node_ids", None)
         cpu_group = get_eplb_group().cpu_group
         if rank_node_ids is not None and len(rank_node_ids) == cpu_group.size():
-            # Elastic EP group switches change the member count, so a cache
-            # built over a retired group fails this size check and is
-            # re-discovered against the active group.
+            # Elastic EP changes the member count, so a stale cache fails this
+            # size check and is re-discovered.
             return rank_node_ids
         num_ranks = cpu_group.size()
-        # Gather host identifiers with a plain tensor collective: the
-        # upstream shared-memory probe (/dev/shm visibility + object
-        # broadcast) fails symmetrically across containers and stateless
-        # groups, producing an all-zero rank mask.
+        # Plain tensor collective: the upstream shared-memory probe gives an
+        # all-zero mask across containers / stateless groups.
         node_key = zlib.crc32(socket.gethostname().encode())
         keys = torch.zeros(num_ranks, dtype=torch.int64)
         keys[torch.distributed.get_rank(group=cpu_group)] = node_key
@@ -385,10 +383,8 @@ class AscendEplbState(_eplb_state.EplbState):
         if prepare_load_stats is None:
             raise TypeError("The selected EPLB policy does not prepare load statistics")
         self._discard_samples_from_old_mapping()
-        # No early return for zero local recorded steps: the rank-counts
-        # all_reduce below is the participation barrier, and a freshly
-        # booted Elastic EP scale-up worker has recorded nothing while the
-        # surviving ranks did — skipping it would deadlock them.
+        # No early return on zero local steps: the all_reduce below is the
+        # participation barrier, so skipping it would deadlock surviving ranks.
         group = get_eplb_group()
         step_indices = self._ordered_load_step_indices()
         rank_counts = self._local_load_collection_mask[step_indices].clone()
@@ -477,13 +473,10 @@ class AscendEplbState(_eplb_state.EplbState):
     def create_communicator(self, model_config: Any, group_coordinator: Any) -> Any:
         communicator = super().create_communicator(model_config, group_coordinator)
         if isinstance(communicator, AscendHixlEplbCommunicator):
-            # Elastic EP rebuilds the expert weights at the switch; the HIXL
-            # communicator resolves them lazily at first transfer instead of
-            # caching the registration-time lists.
+            # HIXL resolves expert weights lazily at first transfer (elastic EP
+            # rebuilds them on switch), and the state stays the session owner.
             model_state = self.model_states[model_config.compute_hash()]
             communicator.bind_weights_provider(model_state)
-            # The lazily created session is registered back on this state, so
-            # the state stays the single owner of the active HIXL session.
             communicator.bind_session_owner(self)
         return communicator
 
@@ -491,15 +484,11 @@ class AscendEplbState(_eplb_state.EplbState):
         model_state = self.model_states[model_config.compute_hash()]
         retired = model_state.communicator
         if isinstance(retired, AscendHixlEplbCommunicator) and retired is not communicator:
-            # Release the retired engine's registrations before the new one
-            # registers the same segments: HIXL rejects in-process overlap
-            # (register_mem status 103900).
+            # Free the retired session's registrations first: HIXL rejects
+            # overlapping register_mem. Drop the stale reference so the
+            # switched-in communicator rebuilds the session.
             session = retired._session
             retired._close()
-            # The retired session is gone: drop the state's stale reference so
-            # the switched-in communicator rebuilds it, eagerly in
-            # ``start_async_loop`` (scale-up reshuffle) or lazily on its first
-            # transfer (scale-down).
             if session is None or self._hixl_session is session:
                 self._hixl_session = None
         super().update_communicator(model_config, communicator)

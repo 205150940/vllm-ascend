@@ -1479,13 +1479,9 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config, self.vllm_config.engram_config)
         ensure_ec_transfer_initialized(self.vllm_config)
         if self.parallel_config.enable_elastic_ep:
-            # Only the stateless EPLB group's torch PGs are consumed through
-            # torch.distributed module-level APIs (the HIXL EPLB session's
-            # collectives and the dynamic-EPLB P2P transfer pass global
-            # ranks); world/dp/ep groups talk through coordinator methods
-            # (PyHccl / TCP store) and never consult ``_world``. Retired
-            # groups are unregistered in
-            # AscendElasticEPScalingExecutor._destroy_retired_groups.
+            # Register the stateless EPLB group for the module-level torch APIs
+            # used by the HIXL session / dynamic-EPLB P2P transfer. Retired
+            # groups are unregistered in _destroy_retired_groups.
             eplb_group = get_eplb_group()
             if isinstance(eplb_group, StatelessGroupCoordinator):
                 register_stateless_coordinator_pgs(eplb_group)
