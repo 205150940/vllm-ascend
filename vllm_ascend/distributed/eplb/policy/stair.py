@@ -227,10 +227,8 @@ class StairEplbPolicy(AbstractEplbPolicy):
         if current_map.ndim != 2 or current_map.shape[1] < num_replicas:
             raise ValueError("current expert placement must be [layers, num_replicas]")
         if current_map.shape[1] > num_replicas:
-            # Elastic EP scale-down passes the old-width placement: upstream
-            # shrinks num_replicas to the surviving topology while the current
-            # map still carries the removed ranks' trailing slot blocks, so
-            # plan over the surviving ranks' slots only.
+            # Scale-down passes the old-width placement (still carries removed
+            # ranks' trailing slots), so plan over surviving slots only.
             slots_per_rank = num_replicas // num_ranks
             if current_map.shape[1] % slots_per_rank or current_map.shape[1] // slots_per_rank <= num_ranks:
                 raise ValueError("current expert placement does not match the scaled-down rank capacity")
@@ -262,9 +260,8 @@ class StairEplbPolicy(AbstractEplbPolicy):
             if len(np.unique(node_ids)) != num_nodes:
                 raise ValueError("num_nodes must match the distinct rank_node_ids")
         cpu_group = get_eplb_group().cpu_group
-        # Elastic EP scale-down plans the surviving topology while the old,
-        # larger EPLB group is still connected: the leaving rank keeps
-        # participating in the shard all-gather until the groups switch.
+        # Scale-down plans the surviving topology while the larger group is
+        # still connected (the leaving rank stays in the shard all-gather).
         if cpu_group.size() < num_ranks:
             raise RuntimeError("STAIR topology does not match the stage-local EPLB group")
 
@@ -345,9 +342,7 @@ class StairEplbPolicy(AbstractEplbPolicy):
             raise ValueError("rank_expert_ids must be an integer [ranks, slots] array")
         if num_experts < 1:
             raise ValueError("num_experts must be positive")
-        # Negative slots are legal in Elastic EP: reconfigure fills expanded
-        # slots with -1 ("empty, to be filled by the next placement"), so
-        # validate and count over the populated slots only.
+        # Elastic EP expansion fills slots with -1 (empty); count populated slots only.
         valid = placement[placement >= 0]
         if np.any(valid >= num_experts):
             raise ValueError("rank_expert_ids contains an out-of-range expert")
@@ -386,9 +381,7 @@ class StairEplbPolicy(AbstractEplbPolicy):
         sample_total_loads = rank_loads.sum(axis=1)
         imbalance_ratios = np.ones(values.shape[0], dtype=np.float64)
         nonzero_load_samples = sample_total_loads > 0
-        # Floating-point rank sums place max and mean on adjacent doubles for
-        # a perfectly balanced sample, rounding the ratio just below one;
-        # clamp so the >= 1 mean/p95 invariants survive downstream validation.
+        # Clamp to 1.0 so floating-point noise keeps the >= 1 mean/p95 invariants.
         imbalance_ratios[nonzero_load_samples] = np.maximum(
             rank_loads[nonzero_load_samples].max(axis=1)
             / (sample_total_loads[nonzero_load_samples] / placement.shape[0]),
@@ -1023,8 +1016,7 @@ class StairEplbPolicy(AbstractEplbPolicy):
             for dst_rank in range(num_ranks)
         ]
         current_has_expert = np.zeros((num_ranks, num_experts), dtype=bool)
-        # -1 slots from Elastic EP expansion hold no expert; skip them
-        # instead of letting the numpy -1 index wrap to the last expert.
+        # Skip Elastic EP's -1 (empty) slots so numpy's -1 index can't wrap.
         valid_slots = current_placement >= 0
         current_has_expert[
             np.broadcast_to(np.arange(num_ranks)[:, None], current_placement.shape)[valid_slots],

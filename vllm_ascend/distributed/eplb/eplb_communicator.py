@@ -483,8 +483,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
 
     def _prepare(self) -> None:
         if self._weights_provider is not None:
-            # Resolve weights at session init: Elastic EP rebuilds them at
-            # the group switch, so the construction-time lists are stale.
+            # Resolve weights at session init: Elastic EP rebuilds them on switch.
             self._all_expert_weights, self._expert_buffer = self._weights_provider()
         if not self._all_expert_weights or not self._all_expert_weights[0] or not self._expert_buffer:
             raise ValueError("HIXL EPLB requires expert weights and receive buffers")
@@ -510,20 +509,15 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._weights_provider = lambda: (model_state.model.expert_weights, model_state.expert_buffer)
 
     def bind_session_owner(self, owner: Any) -> None:
-        """Keep the owning EPLB state weak so the session created on the first
-        transfer is registered back on it, mirroring the eager session that
-        ``start_async_loop`` installs on the state."""
+        """Weakly keep the owning state so a lazily created session is registered back on it."""
         self._session_owner = weakref.ref(owner)
 
     def _ensure_initialized(self) -> None:
         """Initialize on first transfer, not at construction.
 
-        Construction happens during Elastic EP preparation, when the active
-        engine still holds registrations over the same segments (register_mem
-        rejects the overlap with status 103900) and the final layout is not
-        known yet. By the first transfer the groups have switched and the
-        weights have been rebuilt, so registering and exchanging metadata
-        here is both legal and current.
+        At construction (Elastic EP prep) the old engine still holds the same
+        registrations and the layout is not final; by first transfer the groups
+        have switched and the weights rebuilt.
         """
         if self._session is not None:
             self._session.check_usable()
@@ -593,8 +587,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
     def set_stream(self, stream: torch.Stream | None) -> None:
         session = self._session
         if session is None:
-            # HIXL owns its transfer streams; before lazy initialization
-            # there is no engine context to restore.
+            # No engine context to restore before lazy initialization.
             return
         # HIXL owns its streams; restore the engine's initialization context.
         session.check_usable()
@@ -688,12 +681,10 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         return False
 
     def _close(self) -> None:
-        """Release the session registrations (Elastic EP retirement path).
+        """Release the session registrations on the Elastic EP retirement path.
 
-        HIXL register_mem pins the NPU segments at the driver level: the
-        retired communicator's registrations must be released before the
-        switch frees the registered weights and the replacement registers
-        the same segments.
+        register_mem pins the segments, so they must be freed before the switch
+        releases the weights and the replacement registers the same segments.
         """
         if self._session is None:
             return

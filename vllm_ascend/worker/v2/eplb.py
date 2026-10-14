@@ -99,8 +99,8 @@ class AscendEPLBController(EPLBController):
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
     ) -> None:
-        # Update the existing state in place: a fresh EplbState would build a
-        # second communicator over a group the other ranks have already left.
+        # Update in place: a fresh EplbState would build a second communicator
+        # over a group the other ranks have already left.
         assert self.state is not None
         self.state.update_mapping(model_config, expanded_physical_to_logical)
         self._has_registered_models = True
