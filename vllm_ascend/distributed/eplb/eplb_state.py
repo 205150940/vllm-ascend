@@ -25,7 +25,6 @@ from vllm.distributed.eplb.policy import AbstractEplbPolicy
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    in_the_same_node_as,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -675,6 +674,7 @@ class AscendEplbState(_eplb_state.EplbState):
         self,
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
+        use_last_expert_load: bool = False,
     ) -> torch.Tensor | None:
         if self._suspended:
             return None
@@ -699,6 +699,7 @@ class AscendEplbState(_eplb_state.EplbState):
             result = super().rearrange(
                 is_profile=is_profile,
                 rank_mapping=rank_mapping,
+                use_last_expert_load=use_last_expert_load,
             )
         if not is_profile and not self.is_async:
             for model_state in self.model_states.values():
