@@ -3,7 +3,6 @@
 
 """Ascend-owned extensions for the upstream EPLB state."""
 
-import inspect
 import socket
 import threading
 import time
@@ -45,11 +44,6 @@ def _configured_upstream_policy(name: str, policy: AbstractEplbPolicy | None) ->
         yield
     finally:
         policies.pop(name)
-
-
-def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
-    """Return whether the selected vLLM uses the release mapping contract."""
-    return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
