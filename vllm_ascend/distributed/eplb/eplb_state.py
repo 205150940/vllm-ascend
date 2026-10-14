@@ -21,7 +21,6 @@ from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group, get_eplb_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 from vllm.distributed.eplb.policy import AbstractEplbPolicy
-from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
@@ -519,6 +518,7 @@ class AscendEplbState(_eplb_state.EplbState):
         self,
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
+        use_last_expert_load: bool = False,
     ) -> torch.Tensor | None:
         if self._suspended:
             return None
@@ -543,6 +543,7 @@ class AscendEplbState(_eplb_state.EplbState):
             result = super().rearrange(
                 is_profile=is_profile,
                 rank_mapping=rank_mapping,
+                use_last_expert_load=use_last_expert_load,
             )
         if not is_profile and not self.is_async:
             for model_state in self.model_states.values():
