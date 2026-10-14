@@ -31,8 +31,8 @@ from .updatable_graph import (
 )
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
-# Global graph pool handle.
-# In Elastic EP, recompilation and capture must switch the pool to avoid resource reference counting issues.
+# Global graph pool handle; Elastic EP switches the pool on recompile/capture
+# to avoid allocator reference-counting issues.
 _acl_graph_pool: tuple[int, int] | None = None
 _STREAM_RESOURCE_ERROR_CODE = "207008"
 _STREAM_RESOURCE_ERROR_MARKERS = (

@@ -66,11 +66,9 @@ def batch_transfer_weights(
     dp_group: StatelessGroupCoordinator,
     expert_weights: Sequence[Iterable[torch.Tensor]],
 ) -> None:
-    # Ascend HCCL P2P weight transfer. Differs from upstream: collects params
-    # from __dict__/AttentionImplBase and negotiates param names via the TCP
-    # store. HCCL, like PyNccl, transfers flat memory (data_ptr + numel) and
-    # does not honor tensor strides, so non-contiguous params are materialized
-    # into a contiguous copy and copied back on the receive side.
+    # Ascend HCCL P2P transfer: gathers params from state_dict and module
+    # __dict__/AttentionImplBase (some weights aren't registered), negotiates
+    # names over the TCP store, and sends non-contiguous params as flat copies.
     device_comm = dp_group.device_communicator
     tcp_store_group = dp_group.tcp_store_group
     if device_comm is None:
@@ -160,8 +158,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         dp_group: StatelessGroupCoordinator,
         expert_weights: Sequence[Iterable[torch.Tensor]],
     ) -> None:
-        # Ascend HCCL P2P transfer; see the module-level
-        # ``batch_transfer_weights`` for how it differs from upstream.
+        # See module-level batch_transfer_weights.
         batch_transfer_weights(
             model=model,
             is_sender=is_sender,
@@ -176,17 +173,12 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         new_dp_size: int,
         new_world_size_across_dp: int,
     ) -> None:
-        # The standby EPLB group is the only stateless group whose torch PGs
-        # are consumed through torch.distributed module-level APIs (the HIXL
-        # EPLB session's collectives and the dynamic-EPLB P2P transfer pass
-        # global ranks); register it so those calls resolve the group. Paired
-        # with unregistration in _destroy_retired_groups.
+        # Register the standby EPLB group: its torch PGs are consumed through
+        # torch.distributed module-level APIs. Paired with _destroy_retired_groups.
         standby_eplb_group = get_standby_eplb_group()
         if standby_eplb_group is not None:
             register_stateless_coordinator_pgs(standby_eplb_group)
-        # The MC2 standby rendezvous completes only once every member has
-        # joined, so it must be created after the upstream world/dp/ep/eplb
-        # groups, matching the new worker's boot order.
+        # Create the MC2 standby group after the upstream groups (boot order).
         create_ascend_standby_groups(
             new_dp_size=new_dp_size,
             new_world_size_across_dp=new_world_size_across_dp,
@@ -210,8 +202,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if mgr is not None:
             mgr.graphs.clear()
             mgr._graphs_captured = False
-            # NPU graph pools cache old allocations; a fresh pool is
-            # required before re-capture (NPUCachingAllocator.cpp:2106).
+            # A fresh pool is required before re-capture (old allocations are cached).
             mgr.pool = current_platform.graph_pool_handle()
             if hasattr(mgr, "capture_sizes"):
                 capture_sizes = mgr.capture_sizes
@@ -225,11 +216,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         torch.npu.empty_cache()
 
     def _destroy_retired_groups(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
-        # Pair of the ``_register_pg`` call in prepare_reconfiguration:
-        # drop the retired stateless groups from torch's ``_world`` before
-        # their PGs are shut down, so stale entries don't keep the PG
-        # objects (and their HCCL/gloo comms) alive across scaling rounds.
-        # Unregistration must never skip the actual destroy.
+        # Drop retired stateless groups from torch's _world before their PGs
+        # are destroyed; unregistration must never skip the actual destroy.
         try:
             for group in groups:
                 if isinstance(group, StatelessGroupCoordinator):
@@ -254,9 +242,8 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         retired_groups: tuple[GroupCoordinator | None, ...],
         moe_modules: list[nn.Module],
     ) -> tuple[GroupCoordinator | None, ...]:
-        # Swap the MC2 standby group in and refresh the MoE communication
-        # methods against the switched groups. dp_size/dp_rank are read-only
-        # properties on the V2 runner, so no manual refresh is needed here.
+        # Swap in the MC2 standby group; dp_size/dp_rank are read-only V2
+        # properties, so no manual refresh is needed here.
         retired_mc2 = _replace_ascend_active_groups(mc2=pop_ascend_standby_groups())
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
@@ -265,19 +252,15 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             module.moe_config.mc2_group = get_mc2_group()
         self._setup_moe_comm_and_quant_method()
         if retired_mc2 is not None:
-            # The retired MC2 group joins the upstream retired groups so the
-            # executor's async cleanup thread destroys it after the switch.
+            # Hand off to the executor's async cleanup thread.
             return (*retired_groups, retired_mc2)
         return retired_groups
 
     def _close_hixl_communicator(self) -> None:
         """Deregister the active HIXL segments before EEP frees memory.
 
-        HIXL register_mem pins the NPU segments at the driver level: while
-        the registration is alive, releasing those segments (the switch
-        rebuilds the expert weights and empties the cache) fails with
-        AclrtUnmapMem Resource_Busy. The reshuffle is the retired
-        communicator's last use, so deregister right after it.
+        HIXL register_mem pins the NPU segments, so releasing them while
+        registered fails; deregister right after their last use.
         """
         eplb_state = self.worker.model_runner.eplb_state
         if eplb_state is None:
@@ -293,8 +276,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         self._close_hixl_communicator()
 
     def commit_scale_up(self, is_existing_worker: bool) -> None:
-        # The retired communicator is idle across the commit; deregister its
-        # HIXL segments before the switch frees the registered weights.
+        # Deregister HIXL segments before the switch frees the registered weights.
         self._close_hixl_communicator()
         super().commit_scale_up(is_existing_worker)
 
@@ -304,26 +286,20 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         return mapping
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
-        # No-op on Ascend: the dp/ep device_group carries no HCCL traffic
-        # (DP sync on cpu_group, MoE on MC2, EPLB on gloo), so skip the warm.
+        # No-op: the dp/ep device_group carries no HCCL traffic on Ascend.
         return
 
     def _can_reuse_fused_moe_kernel(self) -> bool:
-        # Reuse requires the nixl_ep all2all backend (CUDA-only); NPU always
-        # takes the non-reuse path and re-captures ACL graphs.
+        # Reuse needs the CUDA-only nixl_ep backend; NPU always re-captures graphs.
         return False
 
     def warmup_new_worker(self) -> None:
-        # Upstream warms local kernels here (and re-captures graphs on the
-        # kernel-reuse path); Ascend skips the kernel warmup.
+        # Ascend skips the upstream kernel warmup.
         pass
 
     def warm_and_capture(self) -> None:
-        # No need to save/clear/restore the KV-cache block tables like the
-        # upstream warm_and_capture: the V2 runner's dummy attention uses
-        # all-zero block tables (reserved null block) and PAD_SLOT_ID slot
-        # mappings, so real KV-cache blocks are never written during the
-        # dummy run.
+        # Upstream saves/clears the KV block tables; the V2 dummy run uses null
+        # blocks, so real KV-cache blocks are never written.
         runner = self.worker.model_runner
         self._release_cuda_graphs()
         unlock_workspace()

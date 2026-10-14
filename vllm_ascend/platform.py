@@ -742,7 +742,6 @@ class NPUPlatform(Platform):
         backend_type = ProcessGroup.BackendType.CUSTOM
         pg._register_backend(device, backend_type, backend_class)
         backend_class._set_hccl_comm_name(hccl_comm_name)
-        pg._set_group_desc("undefined")
 
         return pg
 
