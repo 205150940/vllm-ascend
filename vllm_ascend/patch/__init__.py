@@ -1671,3 +1671,25 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+#
+# ** 37. File: worker/patch_sentinel_timing.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.worker.sentinel.gpu_worker_sentinel._reinit_cpu_group`
+#   2. `vllm.v1.worker.sentinel.gpu_worker_sentinel.get_cached_tcp_store_client`
+#    Why:
+#       The FT scale-down recovery spends a significant share of its wall time
+#       inside upstream-internal connection setup (recovery TCP store connect,
+#       DP/TP/EP/EPLB Gloo cpu_group rebuilds) that the upstream retry flow
+#       calls inline, so the Ascend-side stage timer cannot see them without
+#       modifying upstream vLLM.
+#    How:
+#       Wrap both module-level helpers bound in the sentinel module's
+#       namespace so their durations join the active scale-down timer
+#       (ft_scale_down_timing.FtScaleDownTimer) as nested stages
+#       (connect_recovery_store, reinit_{dp,tp,ep,eplb}_cpu_group). With no
+#       scale-down round in flight the wrappers are pass-through.
+#    Related PR (if no, explain why):
+#       No, observability-only and Ascend-specific timing infrastructure.
+#    Future Plan:
+#       Remove this patch once upstream exposes timing hooks (or stage
+#       callbacks) around the FT recovery connection setup.

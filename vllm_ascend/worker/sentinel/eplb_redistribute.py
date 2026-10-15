@@ -12,6 +12,7 @@ import glob
 import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -31,6 +32,7 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_dynamic import (
     scale_from_float_to_int64,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+from vllm_ascend.worker.sentinel.ft_scale_down_timing import get_active_timer
 
 __all__ = [
     "build_orig_to_dense_rank_table",
@@ -59,6 +61,12 @@ _RELOAD_CHUNK_SIZE = 32
 # Threads assembling one chunk; bounded because worker processes share host
 # memory bandwidth.
 _GATHER_MAX_WORKERS = 8
+
+
+def _ft_stage(name: str):
+    """Time a stage when a scale-down round is being timed; no-op otherwise."""
+    timer = get_active_timer()
+    return timer.stage(name) if timer is not None else nullcontext()
 
 
 def _get_ckpt_name_mapper(model: torch.nn.Module) -> Callable[[str], str]:
@@ -471,13 +479,15 @@ def reload_experts_from_disk(
     matched: set[tuple[int, int]] = set()
 
     logger.info("[FT] Reloading %d reassigned (layer, expert) pair(s) on this rank from disk.", len(local_slots))
-    shards = _collect_safetensors_shards(vllm_config, model)
+    with _ft_stage("collect_safetensors_shards"):
+        shards = _collect_safetensors_shards(vllm_config, model)
     if not shards:
         raise RuntimeError(
             "[FT] scale_down expert reload requires a safetensors checkpoint; "
             f"{vllm_config.model_config.model} has none."
         )
-    _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched)
+    with _ft_stage("collect_matching_weights"):
+        _collect_matching_weights(shards, normalize, wanted, wanted_suffixes, buckets, matched)
     # Same reasoning: a pair with no checkpoint weight would leave its slot
     # holding the previous occupant's weights.
     unmatched = [pair for pair in local_slots if pair not in matched]
@@ -491,7 +501,8 @@ def reload_experts_from_disk(
             "an hf_to_vllm_mapper declared on the model class."
         )
 
-    reloaded = _reload_local_slots(routed_layers, local_slots, buckets)
+    with _ft_stage("reload_local_slots"):
+        reloaded = _reload_local_slots(routed_layers, local_slots, buckets)
 
     logger.info("[FT] Expert weight reload complete: %d (layer, expert) pair(s).", reloaded)
     return reloaded

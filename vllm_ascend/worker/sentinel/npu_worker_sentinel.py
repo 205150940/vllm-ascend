@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,11 @@ from vllm_ascend.worker.sentinel.eplb_redistribute import (
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
     reload_experts_from_disk,
+)
+from vllm_ascend.worker.sentinel.ft_scale_down_timing import (
+    FtScaleDownTimer,
+    get_active_timer,
+    set_active_timer,
 )
 
 if TYPE_CHECKING:
@@ -100,6 +106,11 @@ class WorkerSentinel(GPUWorkerSentinel):
         self.worker_faulted = False
         _sentinel = self
 
+    def _ft_stage(self, name: str):
+        """Return a timing stage when a scale-down round is timed; no-op else."""
+        timer = get_active_timer()
+        return timer.stage(name) if timer is not None else nullcontext()
+
     def query_mask(self, ft_request: FaultToleranceRequest) -> dict:
         """Report the dead-rank mask (upstream convention: 0=live, 1=dead)."""
         return {"mask": get_ep_all2all_manager().query_active_mask().tolist()}
@@ -114,8 +125,10 @@ class WorkerSentinel(GPUWorkerSentinel):
     def retry(self, ft_request: FaultToleranceRequest):
         # Reset first so hung device collectives are aborted, then run the
         # base flow and lift the quarantine after the groups are rebuilt.
-        self.reset_device()
-        super().retry(ft_request)
+        with self._ft_stage("reset_device"):
+            self.reset_device()
+        with self._ft_stage("upstream_retry"):
+            super().retry(ft_request)
         self.worker_faulted = False
 
     def init_num_local_experts(self) -> None:
@@ -133,20 +146,53 @@ class WorkerSentinel(GPUWorkerSentinel):
         expert redistribution, dispatching ``retry`` / ``_redistribute_experts``
         to the Ascend overrides below. Ascend adds its platform preconditions
         and a dummy-batch runnability check on top.
-        """
-        self._validate_scale_down_preconditions()
-        super().scale_down(ft_request)
 
-        # Verify the redistributed model is runnable before reporting healthy.
-        parallel_config = self.worker.parallel_config
-        timeout = timedelta(seconds=self.worker.parallel_config.fault_tolerance_config.engine_recovery_timeout_sec)
-        if parallel_config.data_parallel_size > 1:
-            set_gloo_backend_timeout(get_dp_group().cpu_group, timeout)
-        if parallel_config.tensor_parallel_size > 1:
-            set_gloo_backend_timeout(get_tp_group().cpu_group, timeout)
-        self.worker.execute_dummy_batch()
-        self.activate_cpu_group_timeouts(ft_request)
-        torch.npu.synchronize()
+        The whole round is split into timed stages: each stage logs its
+        duration on completion, and a per-stage summary table is logged and
+        dumped to disk (CSV) when the round ends.
+        """
+        timer = FtScaleDownTimer()
+        set_active_timer(timer)
+        try:
+            with timer.stage("validate_preconditions"):
+                self._validate_scale_down_preconditions()
+            with timer.stage("upstream_scale_down"):
+                super().scale_down(ft_request)
+
+            # Verify the redistributed model is runnable before reporting healthy.
+            parallel_config = self.worker.parallel_config
+            timeout = timedelta(seconds=self.worker.parallel_config.fault_tolerance_config.engine_recovery_timeout_sec)
+            with timer.stage("set_recovery_cpu_group_timeouts"):
+                if parallel_config.data_parallel_size > 1:
+                    set_gloo_backend_timeout(get_dp_group().cpu_group, timeout)
+                if parallel_config.tensor_parallel_size > 1:
+                    set_gloo_backend_timeout(get_tp_group().cpu_group, timeout)
+            with timer.stage("dummy_batch"):
+                self.worker.execute_dummy_batch()
+            with timer.stage("activate_cpu_group_timeouts"):
+                self.activate_cpu_group_timeouts(ft_request)
+            with timer.stage("final_synchronize"):
+                torch.npu.synchronize()
+        finally:
+            set_active_timer(None)
+            self._report_scale_down_timing(timer, ft_request)
+
+    def _report_scale_down_timing(self, timer: FtScaleDownTimer, ft_request: FaultToleranceRequest) -> None:
+        """Log the stage summary table and dump it to disk as CSV."""
+        params = ft_request.params
+        rank = getattr(self.worker, "rank", -1)
+        round_key = str(params.get("recovery_round", ""))
+        logger.info(
+            "[FT] Scale-down timing summary (rank=%s, recovery_round=%s, dead_dp_ranks=%s, total=%.1f ms):\n%s",
+            rank,
+            round_key or "NA",
+            params.get("dead_dp_ranks", []),
+            timer.total_ms(),
+            timer.format_table(),
+        )
+        path = timer.dump_to_disk(rank=rank, file_tag=round_key)
+        if path:
+            logger.info("[FT] Scale-down timing table written to %s", path)
 
     def _validate_scale_down_preconditions(self) -> None:
         if not self.worker.use_v2_model_runner:
@@ -193,13 +239,17 @@ class WorkerSentinel(GPUWorkerSentinel):
         num_local_experts = p2l.shape[1] // ep_world_size
 
         mark_dead_expert_slots_inplace(p2l, dead_ep_ranks, num_local_experts)
-        reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
+        with self._ft_stage("redistribute_expert_placement"):
+            reassignments = redistribute_expert_placement(p2l, num_logical, num_local_experts)
         # p2l was updated in place; the commit derives l2p/lrc from it.
-        _commit_eplb_maps(eplb_model_state, p2l.cpu())
-        rebuild_model_expert_maps(model_runner.model, p2l, num_local_experts)
+        with self._ft_stage("commit_eplb_maps"):
+            _commit_eplb_maps(eplb_model_state, p2l.cpu())
+        with self._ft_stage("rebuild_model_expert_maps"):
+            rebuild_model_expert_maps(model_runner.model, p2l, num_local_experts)
 
         if reassignments:
-            reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)
+            with self._ft_stage("reload_experts_from_disk"):
+                reload_experts_from_disk(model_runner.model, self.worker.vllm_config, reassignments)
 
         logger.info(
             "[FT] Expert redistribution: num_logical=%d, ep_world_size=%d, reassignments=%d",
@@ -211,8 +261,10 @@ class WorkerSentinel(GPUWorkerSentinel):
         # Propagate the new placement into the Ascend routing tables (in-place,
         # so captured graphs keep pointing at valid storage), then renumber
         # their ids into the densified space for the MC2 kernels.
-        refresh_model_routing_tables(eplb_model_state)
-        self._densify_routing_tables(eplb_model_state)
+        with self._ft_stage("refresh_model_routing_tables"):
+            refresh_model_routing_tables(eplb_model_state)
+        with self._ft_stage("densify_routing_tables"):
+            self._densify_routing_tables(eplb_model_state)
 
     def _densify_routing_tables(self, eplb_model_state) -> None:
         """Renumber the kernel-facing routing tables into the densified id space.
