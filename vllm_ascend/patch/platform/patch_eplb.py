@@ -361,10 +361,18 @@ def _wrap_communicator_factory(original_factory):
                 cpu_group=bound.arguments["group_coordinator"].cpu_group,
             )
         if backend == "hixl":
+            # Lazy HIXL init is an Elastic-EP-only contract. EEP builds the
+            # communicator before the switch rebuilds the weights, so it defers
+            # session creation to the first transfer; every other deployment has
+            # final weights at construction and validates eagerly. Fall back to
+            # the lazy default when the current config is unavailable.
+            vllm_config = get_current_vllm_config()
+            defer_init = vllm_config is None or vllm_config.parallel_config.enable_elastic_ep
             return AscendHixlEplbCommunicator(
                 cpu_group=bound.arguments["group_coordinator"].cpu_group,
                 all_expert_weights=bound.arguments["expert_weights"],
                 expert_buffer=bound.arguments["expert_buffer"],
+                defer_init=defer_init,
             )
         return original_factory(*bound.args, **bound.kwargs)
 

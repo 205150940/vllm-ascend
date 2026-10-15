@@ -476,6 +476,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[Any]],
         expert_buffer: Sequence[Any],
+        defer_init: bool = True,
     ) -> None:
         self._cpu_group = cpu_group
         self._rank = cpu_group.rank()
@@ -491,6 +492,15 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._layer_idx: int | None = None
         self._pending_reads: dict[int, list[tuple[int, int, int]]] = {}
         self._pending_bytes = 0
+        # Lazy session creation is an Elastic-EP-only contract: EEP builds this
+        # communicator before the switch rebuilds the weights, so it defers
+        # registration to the first transfer. Without Elastic EP the weights are
+        # final here, so resolve and validate them eagerly (fail-fast) unless the
+        # caller explicitly defers. This never registers memory, so validating
+        # eagerly is safe on the EEP path too.
+        self._defer_init = defer_init
+        if not defer_init:
+            self._prepare()
 
     def _prepare(self) -> None:
         if self._weights_provider is not None:
@@ -524,15 +534,20 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
         self._session_owner = weakref.ref(owner)
 
     def _ensure_initialized(self) -> None:
-        """Initialize on first transfer, not at construction.
+        """Create the HIXL session on first transfer.
 
-        At construction (Elastic EP prep) the old engine still holds the same
-        registrations and the layout is not final; by first transfer the groups
-        have switched and the weights rebuilt.
+        Only the Elastic EP path initializes lazily: it constructs the
+        communicator before the switch (weights not final, registrations still
+        held by the active engine), so the communicator factory marks it with
+        ``defer_init`` and registration runs here at the first transfer. Without
+        Elastic EP the state initializes the session eagerly, so a missing
+        session is a contract violation rather than a lazy trigger.
         """
         if self._session is not None:
             self._session.check_usable()
             return
+        if not self._defer_init:
+            raise RuntimeError("HIXL EPLB session must be initialized eagerly when Elastic EP is disabled")
         session = _HixlSession(self._cpu_group)
         self._session = session
         session.initialize({"": self})
