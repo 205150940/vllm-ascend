@@ -6,7 +6,6 @@
 import socket
 import threading
 import time
-import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -286,14 +285,17 @@ class AscendEplbState(_eplb_state.EplbState):
             # size check and is re-discovered.
             return rank_node_ids
         num_ranks = cpu_group.size()
-        # Plain tensor collective: the upstream shared-memory probe gives an
-        # all-zero mask across containers / stateless groups.
-        node_key = zlib.crc32(socket.gethostname().encode())
-        keys = torch.zeros(num_ranks, dtype=torch.int64)
-        keys[torch.distributed.get_rank(group=cpu_group)] = node_key
-        torch.distributed.all_reduce(keys, group=cpu_group)
-        ordinals = {key: ordinal for ordinal, key in enumerate(sorted(set(keys.tolist())))}
-        rank_node_ids = np.array([ordinals[key] for key in keys.tolist()], dtype=np.int64)
+        # Gather hostnames as strings: the upstream shared-memory probe returns
+        # an all-zero mask across containers / stateless groups, and a hashed
+        # key would risk collisions. Ranks on the same host share a node ordinal.
+        hostnames: list[str] = ["" for _ in range(num_ranks)]
+        torch.distributed.all_gather_object(
+            hostnames, socket.gethostname(), group=cpu_group
+        )
+        ordinals = {
+            hostname: ordinal for ordinal, hostname in enumerate(sorted(set(hostnames)))
+        }
+        rank_node_ids = np.array([ordinals[hostname] for hostname in hostnames], dtype=np.int64)
         self._rank_node_ids = rank_node_ids
         return rank_node_ids
 
