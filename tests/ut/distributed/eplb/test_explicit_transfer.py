@@ -63,6 +63,72 @@ class TestExplicitTransfer(unittest.TestCase):
         np.testing.assert_array_equal(metadata.recv_dst_rows, [1, -1])
         self.assertTrue(communicator.executed)
 
+    def test_transfer_skips_empty_elastic_slots(self):
+        communicator = FakeCommunicator()
+        old = torch.tensor([0, 1, 2, -1])
+        new = torch.tensor([0, 2, 1, -1])
+        weights = [torch.tensor([[10.0], [11.0]])]
+        buffers = [torch.zeros_like(weights[0])]
+
+        metadata = stage_explicit_layer_transfer(
+            old,
+            new,
+            np.array([[0, 1], [0, -1]]),
+            np.array([[0, 0], [1, -1]]),
+            weights,
+            buffers,
+            SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+            communicator,
+        )
+
+        self.assertEqual([(rank, expert) for _, rank, expert in communicator.sends], [(1, 1)])
+        self.assertEqual([(rank, expert) for _, rank, expert in communicator.recvs], [(1, 2)])
+        np.testing.assert_array_equal(metadata.is_unchanged, [True, False])
+        np.testing.assert_array_equal(metadata.is_received_locally, [True, False])
+        np.testing.assert_array_equal(metadata.recv_primary_mask, [False, True])
+        self.assertEqual(metadata.recv_count, 1)
+        np.testing.assert_array_equal(metadata.recv_expert_ids, [2, -1])
+        np.testing.assert_array_equal(metadata.recv_dst_rows, [1, -1])
+
+    def test_transfer_marks_local_empty_slot_unchanged(self):
+        communicator = FakeCommunicator()
+        old = torch.tensor([0, 1, 2, -1])
+        new = torch.tensor([0, 2, 1, -1])
+        weights = [torch.tensor([[10.0], [11.0]])]
+        buffers = [torch.zeros_like(weights[0])]
+
+        metadata = stage_explicit_layer_transfer(
+            old,
+            new,
+            np.array([[0, 1], [0, -1]]),
+            np.array([[0, 0], [1, -1]]),
+            weights,
+            buffers,
+            SimpleNamespace(size=lambda: 2, rank=lambda: 1),
+            communicator,
+        )
+
+        self.assertEqual([(rank, expert) for _, rank, expert in communicator.sends], [(0, 2)])
+        self.assertEqual([(rank, expert) for _, rank, expert in communicator.recvs], [(0, 1)])
+        np.testing.assert_array_equal(metadata.is_unchanged, [False, True])
+        np.testing.assert_array_equal(metadata.is_received_locally, [False, False])
+        np.testing.assert_array_equal(metadata.recv_primary_mask, [True, False])
+        self.assertEqual(metadata.recv_count, 1)
+        torch.testing.assert_close(buffers[0][1], torch.zeros_like(buffers[0][1]))
+
+    def test_transfer_still_rejects_invalid_negative_indices(self):
+        with self.assertRaisesRegex(ValueError, "expert indices or -1 empty slots"):
+            stage_explicit_layer_transfer(
+                torch.tensor([0, 1, 2, -2]),
+                torch.tensor([0, 2, 1, -1]),
+                np.array([[0, 1], [0, -1]]),
+                np.array([[0, 0], [1, -1]]),
+                [torch.ones((2, 1))],
+                [torch.zeros((2, 1))],
+                SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+                FakeCommunicator(),
+            )
+
     def test_receiver_initiated_transfer_only_stages_local_destinations(self):
         communicator = FakeCommunicator()
         communicator.receiver_initiated = True
