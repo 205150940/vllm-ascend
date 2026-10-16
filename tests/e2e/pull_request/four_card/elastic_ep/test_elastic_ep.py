@@ -158,7 +158,11 @@ def _downtime(responses: list[tuple[float, float, int | None]]) -> float:
     rejected = [end for _, end, status in responses if status == 503]
     if not rejected:
         return 0
-    recovered = next(end for _, end, status in responses if status == 200 and end > rejected[-1])
+    recovered = next(
+        (end for _, end, status in responses if status == 200 and end > rejected[-1]),
+        None,
+    )
+    assert recovered is not None, "service did not recover after scale commit"
     return recovered - rejected[0]
 
 
@@ -435,7 +439,9 @@ def test_elastic_ep_scaling_qwen3_30b_with_traffic(traffic_mode: str) -> None:
     """Scale dp 4 -> 3 -> 4 under continuous request traffic.
 
     "none" runs the probe only (measures scale duration / downtime),
-    "light" adds a single traffic client, "heavy" one client per DP rank.
+    "light" adds a single traffic client pinned to dp rank 0, "heavy" adds
+    as many unbound traffic clients as the source DP size (requests are
+    routed freely, so no client pins a rank that scale-down may retire).
     Factual-prompt accuracy is still checked after every scaling stage.
     """
     _run_elastic_ep_test(CONFIG_QWEN3_30B_DEFAULT, QWEN3_30B_A3B_MODEL, traffic_mode)
