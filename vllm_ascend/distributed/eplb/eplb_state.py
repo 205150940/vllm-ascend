@@ -289,12 +289,8 @@ class AscendEplbState(_eplb_state.EplbState):
         # an all-zero mask across containers / stateless groups, and a hashed
         # key would risk collisions. Ranks on the same host share a node ordinal.
         hostnames: list[str] = ["" for _ in range(num_ranks)]
-        torch.distributed.all_gather_object(
-            hostnames, socket.gethostname(), group=cpu_group
-        )
-        ordinals = {
-            hostname: ordinal for ordinal, hostname in enumerate(sorted(set(hostnames)))
-        }
+        torch.distributed.all_gather_object(hostnames, socket.gethostname(), group=cpu_group)
+        ordinals = {hostname: ordinal for ordinal, hostname in enumerate(sorted(set(hostnames)))}
         rank_node_ids = np.array([ordinals[hostname] for hostname in hostnames], dtype=np.int64)
         self._rank_node_ids = rank_node_ids
         return rank_node_ids
