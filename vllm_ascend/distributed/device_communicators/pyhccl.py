@@ -168,21 +168,6 @@ class PyHcclCommunicator:
         )
         return out_tensor
 
-    def all_gather(self, in_tensor: torch.Tensor, out_tensor: torch.Tensor, stream=None) -> torch.Tensor:
-        if self.disabled:
-            return None
-        self._check_tensor_device(in_tensor)
-        stream = self._get_stream(stream)
-        self.hccl.hcclAllGather(
-            buffer_type(in_tensor.data_ptr()),
-            buffer_type(out_tensor.data_ptr()),
-            in_tensor.numel(),
-            hcclDataTypeEnum.from_torch(in_tensor.dtype),
-            self.comm,
-            aclrtStream_t(stream.npu_stream),
-        )
-        return out_tensor
-
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return None
