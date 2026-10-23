@@ -267,6 +267,17 @@ def _patch_parallel_config() -> None:
         if (
             _is_npu_platform(_parallel_config.current_platform)
             and config.enable_eplb
+            and config.enable_elastic_ep
+            and config.eplb_config.policy != "default"
+        ):
+            logger.warning(
+                "Elastic EP only supports the default EPLB policy; overriding the configured %r policy with 'default'.",
+                config.eplb_config.policy,
+            )
+            config.eplb_config.policy = "default"
+        if (
+            _is_npu_platform(_parallel_config.current_platform)
+            and config.enable_eplb
             and config.eplb_config.communicator is None
         ):
             # Provisional per-process decision; must precede the upstream
