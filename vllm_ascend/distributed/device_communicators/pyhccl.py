@@ -40,7 +40,6 @@ class PyHcclCommunicator:
         group: ProcessGroup | StatelessProcessGroup,
         device: int | str | torch.device,
         library_path: str | None = None,
-        warmup: bool = True,
     ):
         """
         Args:
@@ -121,13 +120,12 @@ class PyHcclCommunicator:
         with torch.npu.device(device):
             self.comm: hcclComm_t = self.hccl.hcclCommInitRank(self.world_size, self.unique_id, self.rank)
 
-            if warmup:
-                stream = current_stream()
-                # A small all_reduce for warmup.
-                data = torch.zeros(1, device=device)
-                self.all_reduce(data)
-                stream.synchronize()
-                del data
+            stream = current_stream()
+            # A small all_reduce for warmup.
+            data = torch.zeros(1, device=device)
+            self.all_reduce(data)
+            stream.synchronize()
+            del data
 
     def close(self) -> None:
         """Destroy the native communicator at most once."""
