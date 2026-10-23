@@ -75,7 +75,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
         self.pyhccl_comm: PyHcclCommunicator | None = None
         if self.world_size > 1 and tcp_store_group is not None:
-            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device, warmup=False)
+            self.pyhccl_comm = PyHcclCommunicator(group=tcp_store_group, device=self.device)
 
         self.ca_comm = None
         # vLLM #53576 reads this CUDA-only communicator during graph capture.
