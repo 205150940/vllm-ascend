@@ -30,9 +30,9 @@ from vllm.v1.worker.sentinel.gpu_worker_sentinel import (
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
 from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.worker.moe_utils import unwrap_moe
 from vllm_ascend.worker.sentinel.eplb_redistribute import (
     DRAFTER_SUFFIX_MAP,
-    _unwrap_moe,
     build_orig_to_dense_rank_table,
     densify_routing_table_physical_ids,
     reload_experts_from_disk,
@@ -238,9 +238,9 @@ class WorkerSentinel(GPUWorkerSentinel):
         """
         # The served object can be a multimodal wrapper (e.g.
         # AscendDeepseekV41ForCausalLM) without moe_layers; the EPLB state is
-        # registered against the inner MoE-owning model (worker/v2/eplb's
-        # unwrap), so the map rebuild and reload must use that same module.
-        model = _unwrap_moe(model)
+        # registered against the inner MoE-owning model, so the map rebuild
+        # and reload must use that same module.
+        model = unwrap_moe(model)
         p2l = model_state.physical_to_logical_map
         num_local_experts = p2l.shape[1] // get_ep_group().world_size
 

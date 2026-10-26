@@ -5,10 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
-    is_mixture_of_experts,
-)
+from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
 from vllm_ascend.ascend_config import EplbConfig
@@ -16,6 +13,7 @@ from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
 from vllm_ascend.distributed.eplb.policy.factory import create_eplb_policy
 from vllm_ascend.patch.platform.patch_eplb import resolve_ascend_eplb_communicator
 from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.worker.moe_utils import unwrap_moe
 
 
 def is_eplb_load_collection_phase_matched(
@@ -28,11 +26,6 @@ def is_eplb_load_collection_phase_matched(
     batch_phase = "prefill" if batch_has_prefill else "decode"
     return load_collection_phase == batch_phase
 
-
-def _unwrap_moe(model: nn.Module) -> nn.Module:
-    if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
-        return model.get_language_model()
-    return model
 
 
 class AscendEPLBController(EPLBController):
@@ -115,7 +108,7 @@ class AscendEPLBController(EPLBController):
             expanded_physical_to_logical: torch.Tensor,
             old_num_physical_experts: int | None = None,
         ) -> None:
-            model = _unwrap_moe(model)
+            model = unwrap_moe(model)
             assert is_mixture_of_experts(model)
             from_mapping_kwargs: dict[str, Any] = dict(
                 model=model,
