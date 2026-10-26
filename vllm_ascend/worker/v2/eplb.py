@@ -4,11 +4,6 @@
 from typing import Any
 
 import torch
-import torch.nn as nn
-from vllm.model_executor.models.interfaces import (
-    SupportsMultiModal,
-    is_mixture_of_experts,
-)
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
 from vllm_ascend.ascend_config import EplbConfig
@@ -27,11 +22,6 @@ def is_eplb_load_collection_phase_matched(
     batch_phase = "prefill" if batch_has_prefill else "decode"
     return load_collection_phase == batch_phase
 
-
-def _unwrap_moe(model: nn.Module) -> nn.Module:
-    if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
-        return model.get_language_model()
-    return model
 
 
 class AscendEPLBController(EPLBController):
