@@ -23,6 +23,10 @@ from vllm.logger import logger
 from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
+from vllm.model_executor.models.interfaces import (
+    SupportsMultiModal,
+    is_mixture_of_experts,
+)
 
 from vllm_ascend.worker.sentinel.eplb_quant_schemes import (
     _WANTED_SUFFIXES,
@@ -56,6 +60,20 @@ def build_orig_to_dense_rank_table(ep_world_size: int, dead_ranks: set[int]) -> 
     for dense_rank, orig_rank in enumerate(alive):
         table[orig_rank] = dense_rank
     return table
+
+
+def _unwrap_moe(model: torch.nn.Module) -> torch.nn.Module:
+    """Resolve the module that owns ``moe_layers`` for the served model.
+
+    The top-level object can be a multimodal wrapper (e.g.
+    ``AscendDeepseekV41ForCausalLM``) that delegates to an inner language
+    model holding the MoE mixin and ``moe_layers``. Mirrors the EPLB
+    registration unwrap (worker/v2/eplb._unwrap_moe), so the reload operates
+    on the same module the placement maps were registered with.
+    """
+    if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
+        return model.get_language_model()
+    return model
 
 
 def densify_routing_table_physical_ids(
@@ -280,6 +298,7 @@ def reload_experts_from_disk(
     if not reassignments:
         return 0
 
+    model = _unwrap_moe(model)
     moe_layers = list(model.moe_layers)
     routed_layers = [getattr(layer, "routed_experts", layer) for layer in moe_layers]
     ep_rank = get_ep_group().rank_in_group
