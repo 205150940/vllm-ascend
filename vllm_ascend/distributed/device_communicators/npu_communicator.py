@@ -26,7 +26,6 @@ from vllm_ascend.distributed.device_communicators.int8_all_reduce import (
     QuantizedAllReduce,
 )
 from vllm_ascend.distributed.device_communicators.mxfp8_all_reduce import Mxfp8AllReduce
-
 from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
 
