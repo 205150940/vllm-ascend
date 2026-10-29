@@ -23,6 +23,7 @@ import torch
 import vllm
 from torch.distributed import Backend
 from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
+from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 from vllm_ascend.patch.worker._hccl_pg_registry import HcclPgKey, HcclPgRegistry, make_hccl_pg_key
@@ -118,6 +119,9 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.local_rank = local_rank
         self.backend = _normalize_backend(torch_distributed_backend)
         self.torch_distributed_backend = torch_distributed_backend
+        # Forwarded to the gloo cpu group below and to cpu_all_reduce_ waits
+        # (GroupCoordinator caches it at init since #63016).
+        self.cpu_timeout = get_cpu_distributed_timeout_or_none()
         self._acquired_hccl_keys: list[HcclPgKey] = []  # type: ignore[no-redef]
         self._unshared_hccl_groups: list[object] = []  # type: ignore[no-redef]
         self.use_device_communicator = use_device_communicator
@@ -170,7 +174,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
             elif self.backend == "hccl" and self.rank in ranks:
                 self._unshared_hccl_groups.append(device_group)
 
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo") if create_cpu_group else None
+            cpu_group = (
+                torch.distributed.new_group(ranks, backend="gloo", timeout=self.cpu_timeout)
+                if create_cpu_group
+                else None
+            )
             if self.rank in ranks:
                 if create_cpu_group:
                     self.ranks = ranks
