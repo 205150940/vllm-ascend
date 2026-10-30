@@ -23,7 +23,6 @@ def is_eplb_load_collection_phase_matched(
     return load_collection_phase == batch_phase
 
 
-
 class AscendEPLBController(EPLBController):
     """Construct Ascend state and apply phase-filtered load collection."""
 
