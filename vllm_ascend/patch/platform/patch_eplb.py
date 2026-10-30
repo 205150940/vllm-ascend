@@ -375,6 +375,14 @@ def _build_distributed_initial_expert_map(
     """Spread initial redundant experts across EP ranks."""
     if ep_size is None:
         ep_size = EXPERT_MAPPING_EP_SIZE.get()
+    # EPLB registration and the checkpoint mapping each build this layout, and
+    # their results must agree or the weights land in the wrong physical slots.
+    logger.info(
+        "[EPLB] initial expert map: routed=%d redundant=%d ep_size=%d",
+        num_routed_experts,
+        num_redundant_experts,
+        ep_size,
+    )
     if num_redundant_experts == 0:
         return list(range(num_routed_experts))
     num_physical_experts = num_routed_experts + num_redundant_experts
