@@ -257,8 +257,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
         # [debug-trace] MC2 dispatch wall-time (post-startup steps only; sync
-        # during aclgraph capture is illegal)
-        _t0 = time.monotonic() if _dbg_armed() else None
+        # during aclgraph capture is illegal). Pre-sync drains prior device
+        # work so elapsed is this op's own duration.
+        _t0 = None
+        if _dbg_armed():
+            torch.npu.synchronize()
+            _t0 = time.monotonic()
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
         if _t0 is not None:
             torch.npu.synchronize()
@@ -368,7 +372,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
         # [debug-trace] MC2 combine wall-time (post-startup steps only)
-        _t0 = time.monotonic() if _dbg_armed() else None
+        _t0 = None
+        if _dbg_armed():
+            torch.npu.synchronize()
+            _t0 = time.monotonic()
         combined_output = torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
         if _t0 is not None:
             torch.npu.synchronize()

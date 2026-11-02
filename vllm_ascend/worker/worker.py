@@ -291,7 +291,7 @@ def _install_npu_collective_trace() -> None:
             tensor = next((a for a in args if torch.is_tensor(a)), kwargs.get("tensor"))
             if tensor is None or tensor.device.type != "npu":
                 return orig(*args, **kwargs)
-            torch.npu.synchronize()
+            torch.npu.synchronize()  # drain prior device work
             t0 = time.monotonic()
             result = orig(*args, **kwargs)
             torch.npu.synchronize()
