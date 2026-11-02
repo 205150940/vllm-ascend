@@ -25,9 +25,13 @@ from typing import Generic
 
 import torch
 import torch_npu
+import time
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+
+from vllm_ascend.debug_trace import is_armed as _dbg_armed
+from vllm_ascend.debug_trace import trace as _dbg_trace
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
@@ -252,7 +256,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        # [debug-trace] MC2 dispatch wall-time (post-startup steps only; sync
+        # during aclgraph capture is illegal)
+        _t0 = time.monotonic() if _dbg_armed() else None
         output = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+        if _t0 is not None:
+            torch.npu.synchronize()
+            _dbg_trace("[mc2] dispatch elapsed=%.1fms", (time.monotonic() - _t0) * 1000)
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,
@@ -357,7 +367,12 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
+        # [debug-trace] MC2 combine wall-time (post-startup steps only)
+        _t0 = time.monotonic() if _dbg_armed() else None
         combined_output = torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
+        if _t0 is not None:
+            torch.npu.synchronize()
+            _dbg_trace("[mc2] combine elapsed=%.1fms", (time.monotonic() - _t0) * 1000)
 
         return combined_output
 

@@ -18,9 +18,13 @@
 #
 
 import copy
+import functools
 import gc
 import logging
 import os
+import time
+
+import vllm_ascend.debug_trace as debug_trace
 from contextlib import AbstractContextManager, nullcontext
 from fnmatch import filter as fnmatch_filter
 from types import NoneType
@@ -160,6 +164,151 @@ class _V1ModelRunnerFactory:
 
 
 NPUModelRunner = _V1ModelRunnerFactory()
+
+# [debug-trace] appends one shared file across all processes, each line tagged
+# with pid. Handler is created lazily on first use so import never fails on
+# file/permission issues; tracing must never break startup.
+_TRACE_LOG_PATH = os.environ.get("VLLM_TRACE_DEBUG_FILE", "/tmp/vllm_debug_trace.log")
+_trace_logger = logging.getLogger("vllm.debug_trace.file")
+_trace_logger.setLevel(logging.INFO)
+_trace_logger.propagate = False
+
+
+def _proc_tag() -> str:
+    try:
+        import setproctitle
+
+        return setproctitle.getproctitle() or f"pid={os.getpid()}"
+    except Exception:
+        return f"pid={os.getpid()}"
+
+
+def _trace(msg: str, *args) -> None:
+    try:
+        if not _trace_logger.handlers:
+            _handler = logging.FileHandler(_TRACE_LOG_PATH)
+            _handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s.%(msecs)03d pid=%(process)d %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _trace_logger.addHandler(_handler)
+        _trace_logger.info("<%s> " + msg, _proc_tag(), *args)
+    except Exception:
+        pass
+
+
+def _trace_execute_model(func):
+    """[debug-trace] log when a worker receives a step and how long the step took."""
+
+    @functools.wraps(func)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        _maybe_arm_fwd_probes(self)
+        t0 = time.monotonic()
+        num_tokens = getattr(scheduler_output, "total_num_scheduled_tokens", None)
+        logger.info("[execute-model] ENTER num_tokens=%s", num_tokens)
+        _trace("[execute-model] ENTER num_tokens=%s", num_tokens)
+        try:
+            return func(self, scheduler_output, *args, **kwargs)
+        finally:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            logger.info("[execute-model] EXIT elapsed=%.1fms", elapsed_ms)
+            _trace("[execute-model] EXIT elapsed=%.1fms", elapsed_ms)
+
+    return wrapped
+
+
+# [debug-trace] ---- forward-path probes (armed post-startup only) ----
+# synchronize inside aclgraph capture is illegal; capture happens during
+# engine init via runner-internal dummy runs which bypass NPUWorker, so the
+# first wave-time call is guaranteed post-capture.
+
+_fwd_probes_installed = False
+
+
+def _maybe_arm_fwd_probes(worker) -> None:
+    global _fwd_probes_installed
+    if _fwd_probes_installed:
+        return
+    _fwd_probes_installed = True
+    debug_trace.arm()
+    try:
+        model = getattr(getattr(worker, "model_runner", None), "model", None)
+        if model is not None:
+            _install_first_forward_trace(model)
+        _install_npu_collective_trace()
+        _trace("[fwd] probes armed on %s", _proc_tag())
+    except Exception:
+        _trace("[fwd] probe install failed (tracing continues without them)")
+
+
+def _install_first_forward_trace(model) -> None:
+    """Per-module wall-time hooks (torch.npu.synchronize; log >100ms)."""
+
+    import torch
+
+    def _make_pre(name):
+        def pre(module, args):
+            torch.npu.synchronize()
+            module._fwd_t0 = time.monotonic()
+
+        return pre
+
+    def _make_post(name):
+        def post(module, args, output):
+            torch.npu.synchronize()
+            t0 = getattr(module, "_fwd_t0", None)
+            if t0 is not None:
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                debug_trace.trace("[fwd] %s elapsed=%.1fms", name or "<root>", elapsed_ms)
+
+        return post
+
+    count = 0
+    for name, module in model.named_modules():
+        if name.count(".") > 2:
+            continue
+        module.register_forward_pre_hook(_make_pre(name))
+        module.register_forward_hook(_make_post(name))
+        count += 1
+    debug_trace.trace("[fwd] hooks installed on %d modules", count)
+
+
+def _install_npu_collective_trace() -> None:
+    """HCCL collective wall-time (torch.distributed, NPU tensors, log >50ms)."""
+
+    import torch.distributed as dist
+
+    def _wrap(op_name, orig):
+        if getattr(orig, "_fwd_traced", False):
+            return orig
+
+        @functools.wraps(orig)
+        def wrapper(*args, **kwargs):
+            if not debug_trace.is_armed():
+                return orig(*args, **kwargs)
+            tensor = next((a for a in args if torch.is_tensor(a)), kwargs.get("tensor"))
+            if tensor is None or tensor.device.type != "npu":
+                return orig(*args, **kwargs)
+            torch.npu.synchronize()
+            t0 = time.monotonic()
+            result = orig(*args, **kwargs)
+            torch.npu.synchronize()
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            debug_trace.trace(
+                "[hccl] %s shape=%s elapsed=%.1fms",
+                op_name,
+                tuple(tensor.shape),
+                elapsed_ms,
+            )
+            return result
+
+        wrapper._fwd_traced = True
+        return wrapper
+
+    for op_name in ("all_reduce", "all_gather"):
+        setattr(dist, op_name, _wrap(op_name, getattr(dist, op_name)))
 
 
 class NPUWorker(WorkerBase):
@@ -932,6 +1081,7 @@ class NPUWorker(WorkerBase):
         )
 
     @fault_barrier_wrapper
+    @_trace_execute_model
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1500,11 +1650,22 @@ class NPUWorker(WorkerBase):
     # lives in the runtime_guard hook, see runtime_guard_idle_step.
     @runtime_guard_idle_step
     def execute_dummy_batch(self) -> None:
+        _maybe_arm_fwd_probes(self)
         self.log_memory_stats()
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        # Idle DP worker RPCs also need the current config for replay metadata.
-        with set_current_vllm_config(self.vllm_config):
-            self.model_runner._dummy_run(num_tokens, uniform_decode=True, skip_gdn_state_update=True)
+        _t0 = time.monotonic()
+        _trace("[dummy-run] ENTER num_tokens=%d", num_tokens)
+        try:
+            # Idle DP worker RPCs also need the current config for replay metadata.
+            with set_current_vllm_config(self.vllm_config):
+                self.model_runner._dummy_run(
+                    num_tokens, uniform_decode=True, skip_gdn_state_update=True
+                )
+        finally:
+            _trace(
+                "[dummy-run] EXIT elapsed=%.1fms",
+                (time.monotonic() - _t0) * 1000,
+            )
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
