@@ -87,8 +87,9 @@ class WorkerSentinel(GPUWorkerSentinel):
     """Per-worker sentinel for fault tolerance on Ascend NPU.
 
     Handles commands dispatched from EngineCoreSentinel via collective_rpc,
-    including device restart and DP group re-initialization on retry, and
-    MC2 elastic_info masking + expert redistribution on scale_down.
+    including NPU device quiescing on pause, device restart and DP group
+    re-initialization on retry, and MC2 elastic_info masking + expert
+    redistribution on scale_down.
     """
 
     def __init__(self, worker: "Worker", device: torch.device):
@@ -110,6 +111,21 @@ class WorkerSentinel(GPUWorkerSentinel):
         torch_npu.npu.restart_device(self.device.index)
         torch_npu.distributed.reinit_process_group(None, False)
         torch.npu.synchronize()
+
+    def pause(self, ft_request: FaultToleranceRequest):
+        """Drain in-flight NPU work so recovery can start from a quiet device.
+
+        Upstream pauses by synchronizing the device and leaves the actual
+        restart to retry/scale_down. Pin this worker's NPU before syncing:
+        ``collective_rpc`` may run on a thread whose current device is not the
+        worker's, and ``torch.npu.synchronize()`` would otherwise drain the
+        wrong device. If the fault barrier already quarantined the worker it
+        has reset the device (or is resetting it), so do not touch it here.
+        """
+        if self.worker_faulted:
+            return
+        NPUPlatform.set_device(self.device)
+        self.worker.synchronize_device()
 
     def retry(self, ft_request: FaultToleranceRequest):
         # Reset first so hung device collectives are aborted, then run the
