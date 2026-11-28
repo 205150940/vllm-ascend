@@ -256,7 +256,6 @@ def _make_env_dict() -> dict[str, str]:
         "BENCHMARK_HOME": "./benchmark",
         "HCCL_BUFFSIZE": "2048",
         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-        "VLLM_USE_V2_MODEL_RUNNER": "1",
     }
     if os.environ.get("VLLM_USE_MODELSCOPE", "").lower() not in ("", "0", "false"):
         env["VLLM_USE_MODELSCOPE"] = "true"

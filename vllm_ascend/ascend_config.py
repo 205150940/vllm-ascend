@@ -1143,11 +1143,6 @@ class AscendConfig:
         if get_ascend_device_type() != AscendDeviceType.A3:
             raise ValueError("Elastic EP is only supported on A3.")
 
-        if not vllm_config.use_v2_model_runner:
-            raise ValueError(
-                "Elastic EP is only supported with Model Runner V2. Set VLLM_USE_V2_MODEL_RUNNER=1 to enable it."
-            )
-
         if parallel_config.prefill_context_parallel_size > 1:
             raise ValueError(
                 "Elastic EP is not supported with prefill context parallelism "

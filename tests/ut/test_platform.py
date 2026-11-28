@@ -732,7 +732,7 @@ class TestNPUPlatform(TestBase):
             vllm_config.parallel_config.eplb_config.communicator,
         )
 
-    def test_validate_eplb_config_async_rejects_elastic_ep(self):
+    def test_validate_eplb_config_normalizes_elastic_ep_communicator(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.parallel_config.enable_eplb = True
         vllm_config.parallel_config.enable_elastic_ep = True
@@ -740,9 +740,13 @@ class TestNPUPlatform(TestBase):
             use_async=True,
             communicator=None,
         )
+        vllm_config.parallel_config.eplb_config._vllm_ascend_eplb_auto_selected = True
 
-        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "elastic EP"):
+        with patch.dict("os.environ", {}, clear=True):
             _validate_eplb_config(vllm_config)
+
+        assert vllm_config.parallel_config.eplb_config.communicator == "torch_gloo"
+        assert "_vllm_ascend_eplb_auto_selected" not in vllm_config.parallel_config.eplb_config.__dict__
 
     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
         vllm_config = self.mock_vllm_config()

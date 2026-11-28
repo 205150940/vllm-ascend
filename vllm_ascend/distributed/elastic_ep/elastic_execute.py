@@ -11,18 +11,13 @@ from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import set_current_vllm_config
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
-from vllm.distributed.elastic_ep.standby_state import (
-    create_standby_groups,
-    get_standby_ep_group,
-    get_standby_eplb_group,
-)
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
-from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
 from vllm.v1.engine import ReconfigureDistributedRequest
-from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.eplb_utils import preserve_serving_state
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 from vllm_ascend.ascend_forward_context import use_cann_megamoe
@@ -153,7 +148,7 @@ def batch_transfer_weights(
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
-    def _batch_transfer_weights(
+    def _transfer_non_expert_weights(
         self,
         model: nn.Module,
         is_sender: bool,
@@ -169,72 +164,61 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             expert_weights=expert_weights,
         )
 
-    def prepare_reconfiguration(self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool) -> None:
-        # Ascend variant of the upstream preparation: creates the MC2
-        # standby group between the upstream groups and transfer_weights.
-        # The order is load-bearing — stateless rendezvous completes only
-        # when all members join, and new workers boot their groups as
-        # world -> dp -> ep -> eplb -> mc2; any other order deadlocks
-        # scale-up.
-        self._wait_for_group_cleanup()
-        self.reconfig_request = reconfig_request
+    def _prepare_standby_groups(
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        use_all2all: bool,
+    ) -> None:
+        super()._prepare_standby_groups(reconfig_request, use_all2all)
         new_dp_size = reconfig_request.new_data_parallel_size
-        old_dp_size = get_dp_group().world_size
         parallel_config = self.worker.vllm_config.parallel_config
-        world_size = parallel_config.world_size
-        new_world_size_across_dp = world_size * new_dp_size
-        create_standby_groups(
-            new_dp_size=new_dp_size,
-            new_world_size_across_dp=new_world_size_across_dp,
-            master_ip=reconfig_request.new_data_parallel_master_ip,
-            coord_store_port=reconfig_request.coord_store_port,
-            use_all2all=use_all2all,
-            enable_eplb=parallel_config.enable_eplb,
-        )
         if not self._can_reuse_fused_moe_kernel():
             create_ascend_standby_groups(
                 new_dp_size=new_dp_size,
-                new_world_size_across_dp=new_world_size_across_dp,
+                new_world_size_across_dp=parallel_config.world_size * new_dp_size,
                 master_ip=reconfig_request.new_data_parallel_master_ip,
                 coord_store_port=reconfig_request.coord_store_port,
             )
-        # else (graph reuse): keep the current MC2 group — its HCCL comm
-        # name and symm buffer are baked into the captured graphs.
-        # Non-reuse only: stage the standby quant methods (mirrors upstream).
-        standby_ep_group = get_standby_ep_group()
-        assert standby_ep_group is not None
-        all2all_manager = get_ep_all2all_manager(standby_ep_group)
-        all2all_manager.stage_ep_size()
-        if not self._can_reuse_fused_moe_kernel():
-            self.stage_standby_moe_quant_methods(all2all_manager)
-        self._prepare_eplb_communicator(get_standby_eplb_group())
-        if new_dp_size > old_dp_size:
-            self.transfer_weights(old_dp_size, new_dp_size)
 
     def _release_cuda_graphs(self) -> None:
-        if isinstance(self.worker.model_runner.model, UBatchWrapper):
+        runner = self.worker.model_runner
+        if runner.ubatch_runner is not None:
             raise RuntimeError("DBO is not yet supported in elastic EP")
 
+        speculator = runner.speculator
+        graph_managers: list[CudaGraphManager] = []
+        if runner.cudagraph_manager is not None:
+            graph_managers.append(runner.cudagraph_manager)
+        for attr in vars(speculator).values() if speculator else ():
+            if isinstance(attr, CudaGraphManager):
+                graph_managers.append(attr)
+        for manager in graph_managers:
+            manager.release_graphs()
+
         ACLGraphWrapper.clear_all_graphs()
+        graph_pool = ACLGraphWrapper.get_graph_pool()
 
         torch.compiler.reset()
         with set_current_vllm_config(self.worker.vllm_config):
-            reset_compile_wrapper(self.worker.model_runner.get_model())
+            reset_compile_wrapper(runner.get_model())
+            if draft_model := getattr(speculator, "model", None):
+                reset_compile_wrapper(draft_model)
 
         reset_graph_params()
 
-        mgr = self.worker.model_runner.cudagraph_manager
+        # NPU graph pools cache old allocations; all model and draft graph
+        # managers must re-capture into the same fresh pool.
+        for manager in graph_managers:
+            if manager.pool is not None:
+                manager.pool = graph_pool
+
+        mgr = runner.cudagraph_manager
         if mgr is not None:
-            mgr.graphs.clear()
-            mgr._graphs_captured = False
-            # NPU graph pools cache old allocations; a fresh pool is
-            # required before re-capture (NPUCachingAllocator.cpp:2106).
-            mgr.pool = current_platform.graph_pool_handle()
             if hasattr(mgr, "capture_sizes"):
                 capture_sizes = mgr.capture_sizes
-                if self.worker.model_runner.use_aclgraph:
+                if runner.use_aclgraph:
                     set_graph_params(capture_sizes)
-                    if self.worker.model_runner.speculative_config:
+                    if runner.speculative_config:
                         set_draft_graph_params(capture_sizes)
 
         gc.collect()
@@ -251,8 +235,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         reuse = self._can_reuse_fused_moe_kernel()
         # Upstream's reuse branch skips _release_cuda_graphs.
         retired_groups = super().switch_and_prepare()
-        self.worker.model_runner.dp_size = self.worker.parallel_config.data_parallel_size
-        self.worker.model_runner.dp_rank = self.worker.parallel_config.data_parallel_rank
         if reuse:
             # Graphs bake in the old MC2 comm name and symm buffer, so keep
             # the group and comm methods; membership changed via mask writes.
@@ -341,8 +323,17 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         runner = self.worker.model_runner
         self._release_cuda_graphs()
         unlock_workspace()
-        runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        with (
+            self._suppress_eplb(),
+            preserve_serving_state(runner),
+        ):
+            runner._dummy_run(
+                runner.max_num_tokens,
+                is_profile=True,
+                skip_eplb=True,
+                randomize_inputs=self.worker.randomize_dummy_inputs,
+            )
+            self.worker.compile_or_warm_up_model()
         lock_workspace()
 
     def _setup_moe_comm_and_quant_method(self) -> None:

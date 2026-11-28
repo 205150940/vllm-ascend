@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
-_DYNAMIC_EPLB: GroupCoordinator | None = None
 
 # Module specific tensor parallel groups
 _MLP_TP: GroupCoordinator | None = None
@@ -229,12 +228,6 @@ def init_ascend_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="mc2",
-        )
-
-    if get_ascend_config().eplb_config.dynamic_eplb:
-        global _DYNAMIC_EPLB
-        _DYNAMIC_EPLB = init_model_parallel_group(
-            group_ranks, get_world_group().local_rank, backend, group_name="dynamic_eplb"
         )
 
     # Components with the same local TP size reuse the same group along the DP axis.

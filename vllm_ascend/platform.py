@@ -1014,12 +1014,10 @@ class NPUPlatform(Platform):
         group_ranks: list[int],
         backend: str,
     ) -> None:
-        # Register the stateless group in torch's global ``_world``: the
-        # gloo staged EPLB communicator and the MegaMoe symm-buffer
-        # handshake resolve ranks via torch.distributed module-level APIs
-        # (``dist.get_rank(group=...)``), which need the entry. Elastic
-        # group members are not contiguous global ranks, so register the
-        # real {global_rank: group_rank} translation, not an identity map.
+        # NPUCommunicator calls this after a stateless coordinator creates
+        # its process groups. torch.distributed module-level APIs need the
+        # real {global_rank: group_rank} mapping because elastic members are
+        # not necessarily contiguous global ranks.
         rank_map = {global_rank: idx for idx, global_rank in enumerate(group_ranks)}
         _world.pg_group_ranks[pg] = rank_map
         _world.pg_map[pg] = (backend, pg.get_group_store())
@@ -1029,9 +1027,8 @@ class NPUPlatform(Platform):
     @classmethod
     def on_stateless_process_group_destroyed(cls, pg: ProcessGroup) -> None:
         # Mirror of on_stateless_process_group_created, invoked by
-        # StatelessGroupCoordinator.destroy before the PG shuts down; stale
-        # entries would otherwise keep the PG (and its HCCL/gloo comms)
-        # alive across elastic scaling rounds. Idempotent.
+        # NPUCommunicator.destroy before the process group shuts down.
+        # Idempotent.
         _world.pg_map.pop(pg, None)
         _world.pg_names.pop(pg, None)
         _world.pg_group_ranks.pop(pg, None)

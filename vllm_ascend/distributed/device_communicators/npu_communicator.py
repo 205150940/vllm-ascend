@@ -168,7 +168,6 @@ class NPUCommunicator(DeviceCommunicatorBase):
         global_world_size: int | None = None,
         tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
-        stateless: bool | None = None,
     ):
         super().__init__(
             cpu_group,
@@ -178,9 +177,18 @@ class NPUCommunicator(DeviceCommunicatorBase):
             global_ranks,
             global_world_size,
             use_all2all,
-            stateless=stateless,
         )
         self.device = torch.npu.current_device()
+
+        self._stateless_pgs: list[dist.ProcessGroup] = []
+        if tcp_store_group is not None:
+            from vllm.platforms import current_platform
+
+            for pg, backend in ((self.device_group, "hccl"), (self.cpu_group, "gloo")):
+                if pg is None:
+                    continue
+                current_platform.on_stateless_process_group_created(pg, self.ranks, backend)
+                self._stateless_pgs.append(pg)
 
         # Create pyhccl_comm handle for batch_transfer_weights in elastic_ep
         self.pyhccl_comm: PyHcclCommunicator | None = None
@@ -252,6 +260,12 @@ class NPUCommunicator(DeviceCommunicatorBase):
             return super().all_gather(input_, dim)
 
     def destroy(self):
+        if self._stateless_pgs:
+            from vllm.platforms import current_platform
+
+            for pg in self._stateless_pgs:
+                current_platform.on_stateless_process_group_destroyed(pg)
+            self._stateless_pgs.clear()
         if self.pyhccl_comm is not None:
             self.pyhccl_comm.destroy()
             self.pyhccl_comm = None
