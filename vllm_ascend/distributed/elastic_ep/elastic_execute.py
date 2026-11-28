@@ -13,11 +13,11 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import get_standby_eplb_group
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
-from vllm.platforms import current_platform
 from vllm.utils import is_moe_layer
 from vllm.v1.attention.backend import AttentionImplBase
 from vllm.v1.engine import ReconfigureDistributedRequest
-from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.eplb_utils import preserve_serving_state
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 from vllm_ascend.compilation.acl_graph import (
@@ -150,7 +150,7 @@ def batch_transfer_weights(
 
 
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
-    def _batch_transfer_weights(
+    def _transfer_non_expert_weights(
         self,
         model: nn.Module,
         is_sender: bool,
@@ -167,12 +167,14 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             expert_weights=expert_weights,
         )
 
-    def _create_backend_standby_groups(
+    def _prepare_standby_groups(
         self,
         reconfig_request: ReconfigureDistributedRequest,
-        new_dp_size: int,
-        new_world_size_across_dp: int,
+        use_all2all: bool,
     ) -> None:
+        super()._prepare_standby_groups(reconfig_request, use_all2all)
+        new_dp_size = reconfig_request.new_data_parallel_size
+        new_world_size_across_dp = self.worker.vllm_config.parallel_config.world_size * new_dp_size
         # Register the standby EPLB group: its torch PGs are consumed through
         # torch.distributed module-level APIs. Paired with _destroy_retired_groups.
         standby_eplb_group = get_standby_eplb_group()
@@ -187,28 +189,43 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         )
 
     def _release_cuda_graphs(self) -> None:
-        if isinstance(self.worker.model_runner.model, UBatchWrapper):
+        runner = self.worker.model_runner
+        if runner.ubatch_runner is not None:
             raise RuntimeError("DBO is not yet supported in elastic EP")
 
+        speculator = runner.speculator
+        graph_managers: list[CudaGraphManager] = []
+        if runner.cudagraph_manager is not None:
+            graph_managers.append(runner.cudagraph_manager)
+        for attr in vars(speculator).values() if speculator else ():
+            if isinstance(attr, CudaGraphManager):
+                graph_managers.append(attr)
+        for manager in graph_managers:
+            manager.release_graphs()
+
         ACLGraphWrapper.clear_all_graphs()
+        graph_pool = ACLGraphWrapper.get_graph_pool()
 
         torch.compiler.reset()
         with set_current_vllm_config(self.worker.vllm_config):
-            reset_compile_wrapper(self.worker.model_runner.get_model())
+            reset_compile_wrapper(runner.get_model())
+            if draft_model := getattr(speculator, "model", None):
+                reset_compile_wrapper(draft_model)
 
         reset_graph_params()
 
-        mgr = self.worker.model_runner.cudagraph_manager
+        # All model and draft managers must re-capture into the same fresh pool.
+        for manager in graph_managers:
+            if manager.pool is not None:
+                manager.pool = graph_pool
+
+        mgr = runner.cudagraph_manager
         if mgr is not None:
-            mgr.graphs.clear()
-            mgr._graphs_captured = False
-            # A fresh pool is required before re-capture (old allocations are cached).
-            mgr.pool = current_platform.graph_pool_handle()
             if hasattr(mgr, "capture_sizes"):
                 capture_sizes = mgr.capture_sizes
-                if self.worker.model_runner.use_aclgraph:
+                if runner.use_aclgraph:
                     set_graph_params(capture_sizes)
-                    if self.worker.model_runner.speculative_config:
+                    if runner.speculative_config:
                         set_draft_graph_params(capture_sizes)
 
         gc.collect()
@@ -231,20 +248,18 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if retired_mc2 is not None:
             retired_mc2.destroy()
 
-    def _expert_load_view(self, eplb_model_state) -> torch.Tensor:
+    def _get_eplb_expert_load(self, eplb_model_state) -> torch.Tensor:
         # The reconfigured active view, not the maximum-capacity buffer, so
         # set_layer_state derives the per-layer local expert range from the
         # active slot count.
         return eplb_model_state.expert_load_pass
 
-    def _on_topology_switched(
-        self,
-        retired_groups: tuple[GroupCoordinator | None, ...],
-        moe_modules: list[nn.Module],
-    ) -> tuple[GroupCoordinator | None, ...]:
+    def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        retired_groups = super().switch_and_prepare()
         # Swap in the MC2 standby group; dp_size/dp_rank are read-only V2
         # properties, so no manual refresh is needed here.
         retired_mc2 = _replace_ascend_active_groups(mc2=pop_ascend_standby_groups())
+        moe_modules = [module for module in self.worker.model_runner.model.modules() if is_moe_layer(module)]
         for module in moe_modules:
             module.moe_config.tp_group = get_tp_group()
             module.moe_config.dp_group = get_dp_group()
@@ -272,13 +287,22 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         if isinstance(retired, AscendHixlEplbCommunicator):
             retired._close()
 
-    def _after_scale_down_reshuffle(self) -> None:
-        self._close_hixl_communicator()
-
     def commit_scale_up(self, is_existing_worker: bool) -> None:
         # Deregister HIXL segments before the switch frees the registered weights.
         self._close_hixl_communicator()
         super().commit_scale_up(is_existing_worker)
+
+    def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
+        self.perform_scale_down_eplb_reshuffle(new_dp_size)
+        # EPLB transfers are complete; release the HIXL-pinned segments before
+        # the topology switch frees or replaces their backing weights.
+        self._close_hixl_communicator()
+        if removing:
+            self.switch_and_remove()
+        else:
+            retired_groups = self.switch_and_prepare()
+            self.warm_and_capture()
+            self._start_group_cleanup(retired_groups)
 
     def receive_expert_mapping(self) -> torch.Tensor:
         mapping = super().receive_expert_mapping()
@@ -298,13 +322,20 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         pass
 
     def warm_and_capture(self) -> None:
-        # Upstream saves/clears the KV block tables; the V2 dummy run uses null
-        # blocks, so real KV-cache blocks are never written.
         runner = self.worker.model_runner
         self._release_cuda_graphs()
         unlock_workspace()
-        runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        with (
+            self._suppress_eplb(),
+            preserve_serving_state(runner),
+        ):
+            runner._dummy_run(
+                runner.max_num_tokens,
+                is_profile=True,
+                skip_eplb=True,
+                randomize_inputs=self.worker.randomize_dummy_inputs,
+            )
+            self.worker.compile_or_warm_up_model()
         lock_workspace()
 
     def _setup_moe_comm_and_quant_method(self) -> None:
